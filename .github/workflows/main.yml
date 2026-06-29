@@ -1,4 +1,4 @@
-name: Kernel fogos | SukiSU-Ultra + SUSFS
+name: Kernel fogos | RKSU + SUSFS
 
 on:
   workflow_dispatch:
@@ -29,11 +29,6 @@ jobs:
             kernel_src
           echo "=== Kernel version ==="
           head -5 kernel_src/Makefile
-          echo "=== Available vendor configs ==="
-          ls kernel_src/arch/arm64/configs/vendor/
-          echo "=== Ext configs ==="
-          ls kernel_src/arch/arm64/configs/vendor/ext_config/ \
-            2>/dev/null || echo "no ext_config dir"
 
       - name: Download Clang toolchain
         run: |
@@ -44,50 +39,71 @@ jobs:
           tar -xf clang.tar.gz -C clang
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
-      - name: Setup SukiSU-Ultra (susfs-main branch - non-GKI + SUSFS included)
+      - name: Setup RKSU (rsuntk/KernelSU - non-GKI compatible)
         run: |
           cd kernel_src
-          # susfs-main branch: non-GKI support + SUSFS sudah terintegrated
-          # Menggunakan RKSU hook style - tidak ada bug sulog.h
+          # RKSU adalah KSU fork yang dipakai AyakaUI fogos
+          # Khusus untuk non-GKI devices, menggunakan inline hooks
           curl -LSs \
-            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
-            | bash -s susfs-main
-          echo "=== SukiSU-Ultra version ==="
+            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
+            | bash -s main
+          echo "=== RKSU version ==="
           cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3
-          echo "=== KSU driver location ==="
-          ls drivers/kernelsu/ 2>/dev/null || ls KernelSU/ || true
 
-      - name: Fix sulog.h - add missing linux/init.h include
+      - name: Fix kernel 5.4 compatibility issues
         run: |
-          # Fix bug di KSU non-GKI: sulog.h missing #include <linux/init.h>
-          SULOG="kernel_src/drivers/kernelsu/feature/sulog.h"
+          cd kernel_src
+
+          echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
+          echo "    linux/pgtable.h baru ada sejak kernel 5.8"
+          echo "    Solusi: ganti dengan asm/pgtable.h yang ada di 5.4"
+          find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
+            xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
+              sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
+              echo "  Fixed pgtable.h: $f"
+            done
+
+          echo ">>> Fix 2: sulog.h missing linux/init.h"
+          SULOG="drivers/kernelsu/feature/sulog.h"
           if [ -f "$SULOG" ]; then
             if ! grep -q "linux/init.h" "$SULOG"; then
               sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
-              echo "sulog.h patched OK"
+              echo "  Fixed sulog.h: added linux/init.h"
             else
-              echo "sulog.h already has init.h - OK"
+              echo "  sulog.h: already has init.h"
             fi
-          else
-            echo "sulog.h not found - checking other locations..."
-            find kernel_src -name "sulog.h" 2>/dev/null || echo "sulog.h not present"
           fi
+
+          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper (fallback)"
+          mkdir -p include/linux
+          if [ ! -f "include/linux/pgtable.h" ]; then
+            cat > include/linux/pgtable.h << 'HEOF'
+          /* Compatibility wrapper for kernel < 5.8 */
+          #ifndef _LINUX_PGTABLE_COMPAT_H
+          #define _LINUX_PGTABLE_COMPAT_H
+          #include <asm/pgtable.h>
+          #endif
+          HEOF
+            echo "  Created include/linux/pgtable.h compat wrapper"
+          fi
+
+          echo ">>> Verifikasi fixes..."
+          grep -r "linux/pgtable.h" drivers/kernelsu/ 2>/dev/null \
+            && echo "WARNING: masih ada pgtable.h" \
+            || echo "pgtable.h OK - tidak ada lagi"
 
       - name: Apply SUSFS patch for kernel 5.4
         run: |
-          # Download fixed SUSFS patch untuk kernel 5.4 non-GKI
           wget -q \
             https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
             -O susfs_patch.patch
 
-          # Clone SUSFS source files
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
 
           cd kernel_src
 
-          # Copy SUSFS source files ke kernel
           cp ../susfs_src/kernel_patches/fs/susfs.c \
             fs/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/include/linux/susfs.h \
@@ -97,12 +113,10 @@ jobs:
           cp ../susfs_src/kernel_patches/include/linux/sus_su.h \
             include/linux/ 2>/dev/null || true
 
-          # Apply SUSFS patch
           patch -p1 --fuzz=3 < ../susfs_patch.patch \
-            && echo "SUSFS patch: CLEAN" \
-            || echo "SUSFS patch: applied with warnings (normal untuk non-GKI)"
+            && echo "SUSFS patch: OK" \
+            || echo "SUSFS patch: applied with warnings"
 
-          # Bersihkan file sisa patch
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
@@ -110,7 +124,6 @@ jobs:
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
-          export ARCH=arm64
 
           MAKE_ARGS="O=../out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -120,7 +133,7 @@ jobs:
           echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
 
-          echo ">>> Step 2: Merge fogos-specific ext configs"
+          echo ">>> Step 2: Merge fogos ext configs"
           for cfg in \
             arch/arm64/configs/vendor/ext_config/moto-holi.config \
             arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
@@ -128,8 +141,6 @@ jobs:
               echo "  Merging: $cfg"
               ./scripts/kconfig/merge_config.sh \
                 -m -O ../out ../out/.config "$cfg"
-            else
-              echo "  Skip: $cfg not found"
             fi
           done
 
@@ -154,15 +165,12 @@ jobs:
             -d LTO_CLANG \
             -e RELR
 
-          echo ">>> Step 4: olddefconfig (pipe yes untuk semua prompt)"
+          echo ">>> Step 4: olddefconfig"
           yes "" | make $MAKE_ARGS olddefconfig
 
-          echo "=== Verifikasi final config ==="
-          echo "--- KSU ---"
-          grep "CONFIG_KSU" ../out/.config || echo "WARNING: CONFIG_KSU tidak ada!"
-          echo "--- SUSFS ---"
-          grep "CONFIG_KSU_SUSFS" ../out/.config | head -5 || echo "WARNING: SUSFS config tidak ada!"
-          echo "--- LTO ---"
+          echo "=== Config check ==="
+          grep "CONFIG_KSU" ../out/.config || echo "WARNING: KSU missing!"
+          grep "CONFIG_KSU_SUSFS" ../out/.config | head -3
           grep "CONFIG_LTO" ../out/.config
 
       - name: Build kernel
@@ -170,7 +178,7 @@ jobs:
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
 
-          echo ">>> Build dengan $(nproc) threads..."
+          echo ">>> Building dengan $(nproc) threads..."
           yes "" | make -j$(nproc) \
             O=../out \
             ARCH=arm64 \
@@ -182,7 +190,6 @@ jobs:
             LLVM_IAS=1 \
             Image.gz 2>&1 | tee ../build.log
 
-          echo ">>> Cek hasil build..."
           if [ -f ../out/arch/arm64/boot/Image.gz ]; then
             echo "=============================="
             echo "BUILD SUCCESS!"
@@ -203,9 +210,9 @@ jobs:
 
           cat > ak3/anykernel.sh << 'EOF'
           # AnyKernel3 - fogos (Moto G34/G45 5G)
-          # SukiSU-Ultra + SUSFS
+          # RKSU + SUSFS
           properties() { '
-          kernel.string=SukiSU-Ultra + SUSFS | fogos | AyakaUI
+          kernel.string=RKSU + SUSFS | fogos | AyakaUI
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -229,18 +236,17 @@ jobs:
           EOF
 
           DATE=$(date +%Y%m%d-%H%M)
-          ZIP="kernel-fogos-sukisu-susfs-${DATE}.zip"
+          ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
           cd ak3
           zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
-          echo "ZIP siap: ${ZIP}"
           ls -lh "${ZIP}"
 
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-fogos-sukisu-susfs-${{ github.run_number }}
+          name: kernel-fogos-rksu-susfs-${{ github.run_number }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
           if-no-files-found: error
@@ -252,14 +258,3 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: build.log
           retention-days: 7
-
-      - name: Build summary
-        if: success()
-        run: |
-          echo "================================"
-          echo "BUILD SUKSES!"
-          echo "KSU: SukiSU-Ultra susfs-main"
-          echo "SUSFS: JackA1ltman fixed patch"
-          echo "Device: fogos (Moto G34/G45 5G)"
-          echo "ZIP: ${{ env.ZIP_NAME }}"
-          echo "================================"
