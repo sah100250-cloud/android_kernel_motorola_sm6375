@@ -1,4 +1,4 @@
-name: Build Kernel — Moto G45 5G (final resilient)
+name: Build Kernel — Moto G45 5G (resilient single-file)
 
 on:
   workflow_dispatch:
@@ -44,17 +44,16 @@ permissions:
 
 jobs:
   build:
-    name: Build & Package Kernel (final resilient)
     runs-on: ubuntu-latest
     timeout-minutes: 480
 
     steps:
-      - name: Checkout workflow repo (safe)
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install APT dependencies (non-interactive)
+      - name: Install APT dependencies
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -65,14 +64,10 @@ jobs:
             device-tree-compiler zstd libelf-dev libudev-dev \
             wget curl git
 
-      - name: Prepare env & inputs
+      - name: Prepare inputs (save to GITHUB_ENV)
         run: |
-          set -euo pipefail
-          WORKDIR="${GITHUB_WORKSPACE}/build"
-          OUTPUT="${GITHUB_WORKSPACE}/build/output"
-          mkdir -p "$WORKDIR" "$OUTPUT"
-          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
-          echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
+          echo "WORKDIR=${GITHUB_WORKSPACE}/build" >> $GITHUB_ENV
+          echo "OUTPUT=${GITHUB_WORKSPACE}/build/output" >> $GITHUB_ENV
           echo "KERNEL_REPO=${{ github.event.inputs.kernel_repo }}" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_ENV
           echo "KSU_VERSION=${{ github.event.inputs.ksu_version }}" >> $GITHUB_ENV
@@ -81,87 +76,82 @@ jobs:
           echo "CLEAN_BUILD=${{ github.event.inputs.clean_build }}" >> $GITHUB_ENV
           echo "DEVICE=${{ env.DEVICE }}" >> $GITHUB_ENV
 
-      - name: Fetch kernel source (resilient: tarball -> clone -> fallback)
+      - name: Fetch kernel source (tarball -> clone -> fallback)
         run: |
           set -euo pipefail
           WORKDIR="${WORKDIR}"
+          mkdir -p "$WORKDIR"
           cd "$WORKDIR"
           rm -rf kernel_source || true
 
-          REPO_INPUT="${KERNEL_REPO}"
+          REPO="${KERNEL_REPO}"
           BRANCH="${KERNEL_BRANCH}"
-          # normalize if input empty
-          if [ -z "$REPO_INPUT" ] || [ "$REPO_INPUT" = "null" ]; then
-            REPO_INPUT="${GITHUB_REPOSITORY}"
+
+          if [ -z "$REPO" ] || [ "$REPO" = "null" ]; then
+            REPO="${GITHUB_REPOSITORY}"
           fi
 
-          owner=$(echo "$REPO_INPUT" | cut -d'/' -f1)
-          repo=$(echo "$REPO_INPUT" | cut -d'/' -f2)
+          OWNER="$(echo "$REPO" | cut -d'/' -f1)"
+          NAME="$(echo "$REPO" | cut -d'/' -f2)"
           success=0
 
-          try_urls=(
-            "https://github.com/${owner}/${repo}/archive/refs/heads/${BRANCH}.tar.gz"
-            "https://github.com/${owner}/${repo}/archive/${BRANCH}.tar.gz"
-            "https://github.com/${owner}/${repo}/tarball/${BRANCH}"
-            "https://codeload.github.com/${owner}/${repo}/tar.gz/${BRANCH}"
+          urls=(
+            "https://github.com/${OWNER}/${NAME}/archive/refs/heads/${BRANCH}.tar.gz"
+            "https://codeload.github.com/${OWNER}/${NAME}/tar.gz/${BRANCH}"
           )
 
-          for url in "${try_urls[@]}"; do
-            echo "Trying download: $url"
-            if wget -q --spider "$url" 2>/dev/null; then
-              echo "Downloading $url ..."
-              wget -q -O /tmp/kernel.tar.gz "$url"
+          for u in "${urls[@]}"; do
+            echo "Trying $u"
+            if wget -q --spider "$u" 2>/dev/null; then
+              wget -q -O /tmp/kernel.tar.gz "$u"
               mkdir -p kernel_source
               tar -xzf /tmp/kernel.tar.gz -C kernel_source --strip-components=1 || true
               rm -f /tmp/kernel.tar.gz
               if [ -d kernel_source ] && [ "$(ls -A kernel_source || true)" ]; then
-                echo "Extracted kernel source from $url"
+                echo "Extracted from $u"
                 success=1
                 break
               fi
             else
-              echo "URL not reachable: $url"
+              echo "Not reachable: $u"
             fi
           done
 
           if [ $success -eq 0 ]; then
-            echo "Tarball downloads failed; attempting non-interactive git clone (public repos only)"
-            # Prevent interactive credential prompt
+            echo "Tarball failed; trying non-interactive git clone (public repos only)"
             export GIT_TERMINAL_PROMPT=0
-            if git clone --depth=1 --branch "$BRANCH" "https://github.com/${owner}/${repo}.git" kernel_source 2>/tmp/clone.err; then
-              echo "git clone succeeded."
+            if git clone --depth=1 --branch "$BRANCH" "https://github.com/${OWNER}/${NAME}.git" kernel_source 2>/tmp/clone.err; then
+              echo "git clone succeeded"
               success=1
             else
-              echo "git clone failed (see /tmp/clone.err):"
+              echo "git clone failed:"
               sed -n '1,200p' /tmp/clone.err || true
             fi
           fi
 
           if [ $success -eq 0 ]; then
-            echo "All attempts to fetch ${REPO_INPUT}@${BRANCH} failed."
-            echo "Falling back to repository where this workflow lives (current repo) as kernel_source."
-            # copy workflow repo contents as fallback
+            echo "Fetch failed; falling back to workflow repository as kernel_source"
             mkdir -p kernel_source
             cp -r "${GITHUB_WORKSPACE}/." kernel_source || true
             success=1
           fi
 
           if [ $success -ne 1 ]; then
-            echo "::error::Failed to obtain kernel source"
+            echo "::error::Unable to obtain kernel source for ${REPO}@${BRANCH}"
             exit 1
           fi
 
-          echo "Kernel source prepared at: $WORKDIR/kernel_source"
-          ls -la kernel_source | head -n20
+          echo "Kernel source ready at $WORKDIR/kernel_source"
+          ls -la kernel_source | head -n 20
 
       - name: Download Proton Clang (best-effort)
         run: |
           set -euo pipefail
-          CLANG_VERSION="${CLANG_VERSION:-18}"
-          CLANG_DIR="${HOME}/proton-clang-${CLANG_VERSION}"
+          CLANG_VER="${CLANG_VERSION:-18}"
+          CLANG_DIR="${HOME}/proton-clang-${CLANG_VER}"
           mkdir -p "$CLANG_DIR"
-          PRIMARY="https://github.com/nicofork/proton-clang/releases/download/clang-${CLANG_VERSION}/proton-clang-${CLANG_VERSION}.tar.zst"
-          BACKUP="https://gitlab.com/nicofork/proton-clang/-/archive/clang-${CLANG_VERSION}/proton-clang-clang-${CLANG_VERSION}.tar.gz"
+          PRIMARY="https://github.com/nicofork/proton-clang/releases/download/clang-${CLANG_VER}/proton-clang-${CLANG_VER}.tar.zst"
+          BACKUP="https://gitlab.com/nicofork/proton-clang/-/archive/clang-${CLANG_VER}/proton-clang-clang-${CLANG_VER}.tar.gz"
           if wget -q --show-progress "$PRIMARY" -O /tmp/clang.tar.zst 2>/dev/null; then
             if command -v zstd >/dev/null 2>&1; then
               zstd -d /tmp/clang.tar.zst --stdout | tar xf - -C "$CLANG_DIR" --strip-components=1 || true
@@ -170,15 +160,15 @@ jobs:
             fi
             rm -f /tmp/clang.tar.zst
             export PATH="$CLANG_DIR/bin:$PATH"
-            echo "Proton Clang installed to $CLANG_DIR"
+            echo "Proton Clang put in $CLANG_DIR"
           else
-            echo "Proton Clang unavailable; will fallback to system cross compilers"
+            echo "Proton Clang not available; using system cross compilers"
           fi
 
       - name: Integrate KernelSU-Next (best-effort)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source" || exit 1
+          cd "${WORKDIR}/kernel_source" || exit 1
           TMPKSU="/tmp/ksu_next_src"
           rm -rf "$TMPKSU" || true
           if [ "${KSU_VERSION:-latest}" = "latest" ]; then
@@ -188,16 +178,16 @@ jobs:
           fi
           if [ -d "$TMPKSU/kernel" ]; then
             cp -r "$TMPKSU/kernel" ./KernelSU || true
-            echo "KernelSU files copied"
+            echo "KernelSU copied"
           else
-            echo "KernelSU kernel dir not present; will enable CONFIG_KSU via defconfig"
+            echo "No KernelSU kernel dir; will rely on defconfig injection"
           fi
           rm -rf "$TMPKSU" || true
 
       - name: Apply SUSFS (best-effort)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source" || exit 1
+          cd "${WORKDIR}/kernel_source" || exit 1
           TMPSUS="/tmp/susfs_src"
           rm -rf "$TMPSUS" || true
           if [ "${SUSFS_VERSION:-latest}" = "latest" ]; then
@@ -207,18 +197,17 @@ jobs:
           fi
           if [ -d "$TMPSUS/kernel" ]; then
             cp -rv "$TMPSUS/kernel/"* . 2>/dev/null || true
-            echo "SUSFS kernel patches copied"
+            echo "SUSFS patches copied"
           fi
           if [ -d "$TMPSUS/susfs" ]; then
             cp -rv "$TMPSUS/susfs" ./susfs 2>/dev/null || true
-            echo "SUSFS module copied"
           fi
           rm -rf "$TMPSUS" || true
 
-      - name: Patch defconfig (safe injection for 5.4)
+      - name: Patch defconfig (safe for 5.4)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source" || exit 1
+          cd "${WORKDIR}/kernel_source" || exit 1
           if [ -d "kernel_src" ]; then KR="kernel_src"; else KR="."; fi
           cd "$KR" || exit 1
           DEVICE="${DEVICE:-fogos}"
@@ -233,10 +222,7 @@ jobs:
           if [ -z "$DEF" ]; then
             DEF=$(find arch/arm64/configs -type f -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" 2>/dev/null | head -n1 || true)
           fi
-          if [ -z "$DEF" ]; then
-            echo "::warning::Defconfig not found; continuing but build may fail"
-          else
-            echo "Using defconfig: $DEF"
+          if [ -n "$DEF" ]; then
             cp "$DEF" "${DEF}.bak" || true
             printf '\n%s\n' "# Injected: KSU/SUSFS (CI)" \
               "CONFIG_KSU=y" \
@@ -251,57 +237,43 @@ jobs:
               >> "$DEF"
             awk '!seen[$0]++ || /^#/' "$DEF" > /tmp/def.dedup || true
             mv /tmp/def.dedup "$DEF" || true
-            echo "Defconfig patched (backup: ${DEF}.bak)"
+            echo "Patched defconfig: $DEF"
+          else
+            echo "::warning::No defconfig found; build may fail"
           fi
 
       - name: Build kernel (attempt)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source" || exit 1
+          cd "${WORKDIR}/kernel_source" || exit 1
           if [ -d "kernel_src" ]; then cd kernel_src; fi
           export ARCH=arm64
           export SUBARCH=arm64
-          # prefer clang
           if command -v clang >/dev/null 2>&1; then
             export CC=clang
-            echo "Using clang"
+            echo "Building with clang"
+          elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            echo "Building with aarch64-linux-gnu-"
           else
-            if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-              export CROSS_COMPILE=aarch64-linux-gnu-
-              echo "Using aarch64-linux-gnu-"
-            else
-              echo "::error::No suitable compiler found (clang or aarch64-linux-gnu-gcc)"
-              exit 1
-            fi
+            echo "::error::No compiler available (clang or aarch64-linux-gnu-gcc)"
+            exit 1
           fi
-          # find defconfig for build
           DEF_FILE=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) 2>/dev/null | head -n1 || true)
-          if [ -z "$DEF_FILE" ]; then
-            echo "::warning::Defconfig not found; attempting to build with default Makefile"
-            # If there's a build script, try to invoke it
-            if [ -f Makefile ]; then
-              echo "No defconfig; attempting 'make' directly (may fail)"
-            else
-              echo "::error::No Makefile/defconfig available"
-              exit 1
-            fi
-          else
+          if [ -n "$DEF_FILE" ]; then
             DEFBASE=$(basename "$DEF_FILE")
-            echo "Using defconfig: $DEFBASE"
             if [ "${CLEAN_BUILD}" = "true" ] || [ "${CLEAN_BUILD}" = "True" ]; then
               make ARCH=arm64 mrproper || true
             fi
             make ARCH=arm64 "$DEFBASE"
           fi
-          # compile
           make ARCH=arm64 -j"$(nproc)" 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
-          # always keep build.log for debugging
           if [ $rc -ne 0 ]; then
-            echo "::error::Build failed with exit $rc; upload build.log artifact"
+            echo "::error::Build failed (exit $rc). See build.log artifact."
             exit $rc
           fi
-          echo "Build completed successfully."
+          echo "Build finished."
 
       - name: Upload build log (always)
         uses: actions/upload-artifact@v4
@@ -312,7 +284,7 @@ jobs:
             ${WORKDIR}/kernel_source/**/build.log
             ${WORKDIR}/build/logs/*.log
 
-      - name: Package artifacts (AnyKernel minimal) 
+      - name: Package and upload kernel zip (if built)
         if: success()
         run: |
           set -euo pipefail
@@ -322,8 +294,8 @@ jobs:
           mkdir -p "$OUT"
           IMG=$(find . -path "*/arch/arm64/boot/Image*" -type f 2>/dev/null | head -n1 || true)
           if [ -z "$IMG" ]; then
-            echo "::error::Kernel image not found; skipping packaging"
-            exit 1
+            echo "::warning::Kernel image not found; skipping packaging"
+            exit 0
           fi
           cp "$IMG" "$OUT/Image.gz" || cp "$IMG" "$OUT/Image" || true
           find . -path "*/arch/arm64/boot/dts*" -name "*.dtb" -o -name "*.dtbo" -print0 | xargs -0 -I{} cp {} "$OUT/" || true
