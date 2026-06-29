@@ -40,44 +40,42 @@ jobs:
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
       # ============================================================
-      # STEP 1: Setup KernelSU Next dengan branch 'next'
-      # Sumber: https://kernelsu-next.github.io/
-      # KernelSU Next mendukung non-GKI kernel 4.x - 5.4 dengan LTS mode
+      # STEP 1: Setup KernelSU Next dengan mode 'legacy' (untuk non-GKI)
+      # Perhatikan: script membuat folder KernelSU-Next, BUKAN KernelSU
+      # Sumber: https://kernelsu-next.github.io/webpage/pages/installation.html
       # ============================================================
-      - name: Setup KernelSU Next
+      - name: Setup KernelSU Next (non-GKI mode)
         run: |
           cd kernel_src
-          # Gunakan branch 'next' yang sudah mature untuk non-GKI
-          # Jangan pakai tag v1.1.1 karena masih ada bug
+          # Gunakan parameter 'legacy' untuk mendukung kernel 4.x - 5.4 non-GKI
+          # Script ini akan membuat folder KernelSU-Next dan symlink ke drivers/kernelsu
           curl -LSs \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s next
+            | bash -s legacy
           echo "=== KernelSU Next version ==="
-          cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3 || echo "OK"
+          # Folder yang benar adalah KernelSU-Next, BUKAN KernelSU
+          cat KernelSU-Next/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3 || echo "OK"
 
       # ============================================================
-      # STEP 2: Fix untuk Non-GKI
-      # Sumber: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      # STEP 2: Fix untuk Non-GKI - Manual hook
+      # Folder yang benar: KernelSU-Next (bukan KernelSU)
       # ============================================================
       - name: Fix KernelSU Next for Non-GKI
         run: |
-          cd kernel_src/KernelSU
+          # PERHATIAN: Folder yang benar adalah KernelSU-Next, BUKAN KernelSU
+          cd kernel_src/KernelSU-Next
           
           echo ">>> Non-GKI: Revert commit untuk kompatibilitas"
-          # Commit ini menghapus dukungan non-GKI, harus di-revert
           git revert 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 --no-edit || true
           
           echo ">>> Non-GKI: Nonaktifkan KPROBES (manual hook)"
-          # Ganti semua #ifdef CONFIG_KPROBES menjadi #if defined(CONFIG_KPROBES) && 0
-          # Ini adalah langkah WAJIB untuk non-GKI
           find . -name "*.c" -o -name "*.h" | xargs sed -i \
             's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
           
           echo ">>> Non-GKI: Aktifkan KSU_MANUAL_HOOK"
           sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
           
-          echo ">>> Non-GKI: Tambahkan dukungan SUSFS_MAGIC"
-          # Untuk kompatibilitas dengan SUSFS
+          echo ">>> Non-GKI: Tambahkan SUSFS_MAGIC untuk kompatibilitas"
           if ! grep -q "SUSFS_MAGIC" include/ksu.h; then
             echo "#define SUSFS_MAGIC 0x53465346" >> include/ksu.h
           fi
@@ -108,33 +106,33 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 3: Apply SUSFS patch dari susfs4ksu official
-      # Sumber: https://gitlab.com/simonpunk/susfs4ksu/-/tree/kernel-5.4
+      # STEP 3: Apply SUSFS patch
+      # Gunakan patch gabungan dari hauzer yang sudah terbukti berhasil
       # ============================================================
-      - name: Apply SUSFS patch for kernel 5.4
+      - name: Apply SUSFS patch
         run: |
-          # Clone SUSFS dengan tag stabil v1.5.5
+          cd kernel_src
+          
+          # Clone SUSFS
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
           
-          cd kernel_src
-          
           echo ">>> Step 1: Copy file SUSFS ke kernel source"
-          cp ../susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
+          cp susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
+          cp susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
+          cp susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
+          cp susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
           
-          echo ">>> Step 2: Patch KernelSU Kconfig (10_enable_susfs_for_ksu.patch)"
-          cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-          cd KernelSU && patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true && cd ..
+          echo ">>> Step 2: Patch KernelSU-Next Kconfig"
+          cp susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU-Next/
+          cd KernelSU-Next && patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true && cd ..
           
-          echo ">>> Step 3: Patch kernel 5.4 (50_add_susfs_in_kernel-5.4.patch)"
-          cp ../susfs_src/kernel_patches/50_add_susfs_in_kernel-5.4.patch ../
+          echo ">>> Step 3: Patch kernel 5.4"
+          cp susfs_src/kernel_patches/50_add_susfs_in_kernel-5.4.patch ../
           patch -p1 --fuzz=3 < ../50_add_susfs_in_kernel-5.4.patch \
             && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings (some hunks may fail - this is normal)"
+            || echo "SUSFS patch: applied with warnings"
           
           echo ">>> Step 4: Bersihkan file reject"
           find . -name "*.orig" -delete 2>/dev/null || true
@@ -142,7 +140,6 @@ jobs:
 
       # ============================================================
       # STEP 4: Perbaikan manual untuk error compile
-      # Berdasarkan solusi dari berbagai sumber yang berhasil
       # ============================================================
       - name: Fix SUSFS compilation errors
         run: |
@@ -174,7 +171,7 @@ jobs:
               /unsigned int sequential_io;/a\
               \tunsigned int susfs_task_state;
             }' include/linux/sched.h
-            echo "  Added susfs_task_state to task_struct"
+            echo "  Added susfs_task_state"
           fi
           
           echo ">>> Fix 4: Tambahkan TASK_STRUCT_NON_ROOT_USER_APP_PROC"
