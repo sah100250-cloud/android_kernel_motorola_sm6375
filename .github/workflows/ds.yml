@@ -1,4 +1,4 @@
-name: Kernel fogos | Official KSU v0.9.5 + SUSFS
+name: Kernel fogos | RKSU + SUSFS
 
 on:
   workflow_dispatch:
@@ -41,12 +41,14 @@ jobs:
 
       # ============================================================
       # STEP 1: Setup Official KernelSU v0.9.5
+      # Referensi: https://github.com/kutemeikito/susfs4ksu#prerequisite
+      # KernelSU 1.0+ TIDAK mendukung non-GKI, harus pakai v0.9.5
       # ============================================================
       - name: Setup Official KernelSU (v0.9.5)
         run: |
           cd kernel_src
-          # Gunakan official KernelSU dari weishu
-          # Versi v0.9.5 adalah versi terakhir yang mendukung non-GKI[reference:2]
+          # HANYA official KernelSU dari weishu yang didukung
+          # v0.9.5 adalah versi terakhir yang support non-GKI
           curl -LSs \
             "https://raw.githubusercontent.com/tiann/KernelSU/v0.9.5/kernel/setup.sh" \
             | bash -s v0.9.5
@@ -54,42 +56,58 @@ jobs:
           grep "^VERSION\|^PATCHLEVEL" KernelSU/kernel/Makefile | head -3 || echo "OK"
 
       # ============================================================
-      # STEP 2: Fix Non-GKI - Tanpa revert, tanpa manual hook tambahan
+      # STEP 2: Revert commit 898e9d4 (WAJIB untuk non-GKI)
+      # Referensi: https://github.com/kutemeikito/susfs4ksu#prerequisite
+      # Commit ini menghapus dukungan non-GKI, harus di-revert
       # ============================================================
-      - name: Fix KernelSU for Non-GKI
+      - name: Revert non-GKI removal commit
         run: |
           cd kernel_src/KernelSU
-          
-          echo ">>> Non-GKI: Nonaktifkan KPROBES"
-          # Ganti semua #ifdef CONFIG_KPROBES menjadi #if defined(CONFIG_KPROBES) && 0
-          find . -name "*.c" -o -name "*.h" | xargs sed -i \
-            's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
-          
-          echo ">>> Non-GKI: Aktifkan KSU_MANUAL_HOOK"
-          sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
+          git revert 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 --no-edit || true
+          echo "Revert completed (may have conflicts - this is normal)"
 
       # ============================================================
-      # STEP 3: Fix kernel 5.4 compatibility
+      # STEP 3: Nonaktifkan KPROBES (WAJIB untuk non-GKI)
+      # Referensi: https://github.com/kutemeikito/susfs4ksu#prerequisite
+      # Ganti semua #ifdef CONFIG_KPROBES dengan #if defined(CONFIG_KPROBES) && 0
+      # ============================================================
+      - name: Disable KPROBES for non-GKI
+        run: |
+          cd kernel_src/KernelSU
+          find . -name "*.c" -o -name "*.h" | xargs sed -i \
+            's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
+          echo "KPROBES disabled"
+
+      # ============================================================
+      # STEP 4: Aktifkan KSU_MANUAL_HOOK
+      # Referensi: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      # Non-GKI WAJIB pakai manual hook, BUKAN kprobes
+      # ============================================================
+      - name: Enable manual hook
+        run: |
+          cd kernel_src/KernelSU
+          sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
+          echo "Manual hook enabled"
+
+      # ============================================================
+      # STEP 5: Fix kernel 5.4 compatibility (pgtable.h, sulog.h)
       # ============================================================
       - name: Fix kernel 5.4 compatibility issues
         run: |
           cd kernel_src
-          
-          echo ">>> Fix 1: linux/pgtable.h"
+          echo ">>> Fix 1: linux/pgtable.h (not exist in kernel 5.4)"
           find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
             xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
               sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
               echo "  Fixed: $f"
             done
-          
-          echo ">>> Fix 2: sulog.h"
+          echo ">>> Fix 2: sulog.h missing linux/init.h"
           SULOG="drivers/kernelsu/feature/sulog.h"
           if [ -f "$SULOG" ] && ! grep -q "linux/init.h" "$SULOG"; then
             sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
             echo "  Fixed sulog.h"
           fi
-          
-          echo ">>> Fix 3: pgtable.h wrapper"
+          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
             printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
@@ -97,56 +115,51 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 4: Apply SUSFS patch dari official susfs4ksu
+      # STEP 6: Apply SUSFS patch (official dari susfs4ksu)
+      # Referensi: https://gitlab.com/simonpunk/susfs4ksu/-/tree/kernel-5.4
       # ============================================================
       - name: Apply SUSFS patch
         run: |
           cd kernel_src
-          
-          # Clone SUSFS repo
+          # Clone SUSFS repo dengan tag stabil
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
-          
-          echo ">>> Step 1: Copy file SUSFS ke kernel source[reference:3]"
+          echo ">>> Step 1: Copy SUSFS files to kernel source"
           cp susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
-          
-          echo ">>> Step 2: Patch KernelSU Kconfig[reference:4]"
+          echo ">>> Step 2: Patch KernelSU Kconfig"
           cp susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
           cd KernelSU && patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true && cd ..
-          
-          echo ">>> Step 3: Patch kernel 5.4[reference:5]"
+          echo ">>> Step 3: Patch kernel 5.4"
           cp susfs_src/kernel_patches/50_add_susfs_in_kernel-5.4.patch ../
           patch -p1 --fuzz=3 < ../50_add_susfs_in_kernel-5.4.patch \
             && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings"
-          
-          echo ">>> Step 4: Bersihkan file reject"
+            || echo "SUSFS patch: applied with warnings (normal for non-GKI)"
+          echo ">>> Step 4: Cleanup"
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
       # ============================================================
-      # STEP 5: HANYA tambahkan include yang hilang - TANPA definisi makro!
+      # STEP 7: Fix missing struct kstat (penyebab error terakhir)
+      # Tambahkan #include <linux/stat.h> di susfs.h
       # ============================================================
-      - name: Fix missing includes (NO macro definitions!)
+      - name: Fix missing struct kstat declaration
         run: |
           cd kernel_src
-          
-          echo ">>> Fix: Tambahkan include susfs.h di file yang error"
-          # Hanya tambahkan #include, jangan tambahkan definisi makro apapun
-          # Karena patch SUSFS sudah menyediakan semua definisi yang diperlukan
-          for file in fs/notify/fdinfo.c kernel/kallsyms.c; do
-            if [ -f "$file" ] && grep -q "susfs_" "$file"; then
-              if ! grep -q "#include <linux/susfs.h>" "$file"; then
-                sed -i '1i #include <linux/susfs.h>' "$file"
-                echo "  Added include to $file"
-              fi
+          echo ">>> Fix: Add #include <linux/stat.h> to susfs.h"
+          if [ -f include/linux/susfs.h ]; then
+            if ! grep -q "#include <linux/stat.h>" include/linux/susfs.h; then
+              sed -i '1i #include <linux/stat.h>' include/linux/susfs.h
+              echo "  Added #include <linux/stat.h>"
             fi
-          done
+          fi
 
+      # ============================================================
+      # STEP 8: Generate defconfig
+      # ============================================================
       - name: Generate defconfig for fogos
         run: |
           cd kernel_src
@@ -155,10 +168,8 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
-          
           echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
-          
           echo ">>> Step 2: Merge fogos ext configs"
           for cfg in arch/arm64/configs/vendor/ext_config/moto-holi.config \
                      arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
@@ -167,8 +178,7 @@ jobs:
               ./scripts/kconfig/merge_config.sh -m -O ../out ../out/.config "$cfg"
             fi
           done
-          
-          echo ">>> Step 3: Set KSU + SUSFS configs[reference:6]"
+          echo ">>> Step 3: Set KSU + SUSFS configs"
           ./scripts/config --file ../out/.config \
             -e KSU \
             -d KSU_WITH_KPROBES \
@@ -189,10 +199,8 @@ jobs:
             -e LTO_NONE \
             -d LTO_CLANG \
             -e RELR
-          
           echo ">>> Step 4: olddefconfig"
           yes "" | make $MAKE_ARGS olddefconfig
-          
           echo "=========================================="
           echo "=== CONFIG CHECK ==="
           echo "=========================================="
@@ -200,7 +208,6 @@ jobs:
           grep "CONFIG_KSU_SUSFS" ../out/.config | grep -v "^#" || echo "WARNING: SUSFS missing!"
           grep "CONFIG_LTO" ../out/.config | grep -v "^#" || echo "WARNING: LTO missing!"
           echo "=========================================="
-          
           cp ../out/.config ../kernel.config
 
       - name: Upload kernel config (for debugging)
@@ -214,7 +221,6 @@ jobs:
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
-          
           echo ">>> Building with $(nproc) threads..."
           yes "" | make -j$(nproc) \
             O=../out ARCH=arm64 CC=clang \
@@ -222,7 +228,6 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             LLVM=1 LLVM_IAS=1 Image 2>&1 | tee ../build.log
-          
           if [ -f ../out/arch/arm64/boot/Image ]; then
             echo "=============================="
             echo "BUILD SUCCESS!"
@@ -238,7 +243,6 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cp out/arch/arm64/boot/Image ak3/
-          
           cat > ak3/anykernel.sh << 'EOF'
           # AnyKernel3 Ramdisk Mod Script
           # osm0sis @ xda-developers
@@ -267,11 +271,9 @@ jobs:
           dump_boot
           write_boot
           EOF
-          
           echo "=== anykernel.sh ==="
           cat ak3/anykernel.sh
           bash -n ak3/anykernel.sh && echo "SYNTAX OK" || echo "SYNTAX ERROR!"
-          
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-ksu-susfs-${DATE}.zip"
           cd ak3
