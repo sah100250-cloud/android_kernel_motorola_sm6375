@@ -24,7 +24,7 @@ jobs:
       - name: Clone kernel source
         run: |
           git clone --depth=1 \
-            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
+            https://github.comMotorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
             -b sixteen \
             kernel_src
           echo "=== Kernel version ==="
@@ -39,9 +39,6 @@ jobs:
           tar -xf clang.tar.gz -C clang
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
-      # ============================================================
-      # Setup RKSU dengan release tag (bukan main) untuk Non-GKI
-      # ============================================================
       - name: Setup RKSU (rsuntk/KernelSU - non-GKI)
         run: |
           cd kernel_src
@@ -52,31 +49,23 @@ jobs:
           echo "=== RKSU version ==="
           grep "^VERSION\|^PATCHLEVEL" KernelSU/kernel/Makefile | head -3
 
-      # ============================================================
-      # Fix untuk Non-GKI (WAJIB)
-      # ============================================================
       - name: Fix KernelSU for Non-GKI compatibility
         run: |
           cd kernel_src/KernelSU
-          # Revert commit yang menyebabkan SUSFS tidak bisa di-patch di Non-GKI
           git revert 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 --no-edit || true
-          # Nonaktifkan KPROBES (SUS_SU tidak didukung)
           find . -name "*.c" -o -name "*.h" | xargs sed -i \
             's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g'
-          # Pastikan manual hook aktif
           sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
 
       - name: Fix kernel 5.4 compatibility issues
         run: |
           cd kernel_src
-
           echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
           find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
             xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
               sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
               echo "  Fixed pgtable.h: $f"
             done
-
           echo ">>> Fix 2: sulog.h missing linux/init.h"
           SULOG="drivers/kernelsu/feature/sulog.h"
           if [ -f "$SULOG" ]; then
@@ -87,53 +76,36 @@ jobs:
               echo "  sulog.h: already has init.h"
             fi
           fi
-
-          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper (fallback)"
+          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
             printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
               > include/linux/pgtable.h
             echo "  Created include/linux/pgtable.h compat wrapper"
           fi
-
           echo ">>> Verifikasi fixes..."
           grep -r "linux/pgtable.h" drivers/kernelsu/ 2>/dev/null \
             && echo "WARNING: masih ada pgtable.h" \
             || echo "pgtable.h OK"
 
-      # ============================================================
-      # Apply SUSFS patch dengan urutan yang benar
-      # ============================================================
       - name: Apply SUSFS patch for kernel 5.4
         run: |
           wget -q \
             https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
             -O susfs_patch.patch
-
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
-
           cd kernel_src
-
-          cp ../susfs_src/kernel_patches/fs/susfs.c \
-            fs/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs.h \
-            include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs_def.h \
-            include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/sus_su.h \
-            include/linux/ 2>/dev/null || true
-
-          # Patch KSU Kconfig agar muncul opsi KSU_SUSFS
+          cp ../susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
           cd KernelSU && patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true && cd ..
-
-          # Patch kernel 5.4
           patch -p1 --fuzz=3 < ../susfs_patch.patch \
             && echo "SUSFS patch: OK" \
             || echo "SUSFS patch: applied with warnings"
-
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
@@ -141,15 +113,12 @@ jobs:
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
-
           MAKE_ARGS="O=../out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
-
           echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
-
           echo ">>> Step 2: Merge fogos ext configs"
           for cfg in \
             arch/arm64/configs/vendor/ext_config/moto-holi.config \
@@ -160,7 +129,6 @@ jobs:
                 -m -O ../out ../out/.config "$cfg"
             fi
           done
-
           echo ">>> Step 3: Set KSU + SUSFS + LTO configs"
           ./scripts/config --file ../out/.config \
             -e KSU \
@@ -181,15 +149,12 @@ jobs:
             -e LTO_NONE \
             -d LTO_CLANG \
             -e RELR
-
           echo ">>> Step 4: olddefconfig"
           yes "" | make $MAKE_ARGS olddefconfig
-
           echo "=== Config check ==="
           grep "CONFIG_KSU" ../out/.config | grep -v "^#" || echo "WARNING: KSU missing!"
           grep "CONFIG_KSU_SUSFS" ../out/.config | grep -v "^#" || echo "WARNING: SUSFS missing!"
           grep "CONFIG_LTO" ../out/.config | grep -v "^#" || echo "WARNING: LTO missing!"
-
           cp ../out/.config ../kernel.config
 
       - name: Upload kernel config (for debugging)
@@ -203,8 +168,7 @@ jobs:
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
-
-          echo ">>> Building dengan $(nproc) threads..."
+          echo ">>> Building with $(nproc) threads..."
           yes "" | make -j$(nproc) \
             O=../out \
             ARCH=arm64 \
@@ -215,7 +179,6 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             Image 2>&1 | tee ../build.log
-
           if [ -f ../out/arch/arm64/boot/Image ]; then
             echo "=============================="
             echo "BUILD SUCCESS!"
@@ -227,17 +190,11 @@ jobs:
             exit 1
           fi
 
-      # ============================================================
-      # Package AnyKernel3 dengan block=auto (fix partition error)
-      # ============================================================
       - name: Package AnyKernel3
         run: |
           git clone --depth=1 \
             https://github.com/osm0sis/AnyKernel3.git ak3
-
           cp out/arch/arm64/boot/Image ak3/
-
-          # Tulis anykernel.sh dengan block=auto (bukan hardcode)
           cat > ak3/anykernel.sh << 'EOF'
 # AnyKernel3 Ramdisk Mod Script
 # osm0sis @ xda-developers
@@ -278,12 +235,10 @@ dump_boot
 write_boot
 ## end boot install
 EOF
-
           echo "=== Verifikasi anykernel.sh ==="
           cat ak3/anykernel.sh
           echo "=== Syntax check ==="
           bash -n ak3/anykernel.sh && echo "SYNTAX OK" || echo "SYNTAX ERROR!"
-
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
           cd ak3
@@ -291,7 +246,6 @@ EOF
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
           ls -lh "${ZIP}"
-
           echo "=== Isi ZIP ==="
           unzip -l "${ZIP}" | head -30
 
