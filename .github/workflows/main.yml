@@ -14,7 +14,7 @@ on:
         default: 'latest'
         type: string
       clang_version:
-        description: 'Proton Clang version'
+        description: 'Proton Clang version (17/18/19)'
         required: false
         default: '18'
         type: choice
@@ -29,6 +29,7 @@ on:
         type: boolean
 
 env:
+  # Adjust if you want a different kernel repo/branch
   KERNEL_REPO: 'AnandSuresh02/android_kernel_motorola_sm6375'
   KERNEL_BRANCH: 'main'
   DEVICE: 'fogos'
@@ -39,37 +40,41 @@ permissions:
 
 jobs:
   build:
-    name: Build and Package Kernel (fogos)
+    name: Build & Package Kernel (fogos, 5.4-ready)
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
+      - name: Checkout repository (shallow)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
 
-      - name: Install packages
+      - name: Install required packages
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -yqq \
+          sudo apt-get install -yqq --no-install-recommends \
             bc bison flex gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
-            libc6-dev libssl-dev lz4 libncurses5 make openssl \
+            libc6-dev libncurses-dev libssl-dev lz4 make openssl \
             perl python3 python3-pip xz-utils ccache zip unzip \
             device-tree-compiler zstd libelf-dev libudev-dev \
             wget curl git
 
-      - name: Set runner environment variables
+      - name: Prepare workspace variables
         run: |
-          # WORKDIR and OUTPUTDIR based on runner-provided temp dir
-          echo "WORKDIR=${RUNNER_TEMP}/kernel_build" >> $GITHUB_ENV
-          echo "OUTPUTDIR=${RUNNER_TEMP}/kernel_output" >> $GITHUB_ENV
-          # Inputs -> env for use in later steps
+          set -euo pipefail
+          WORKDIR="${GITHUB_WORKSPACE}/build"
+          OUTPUT="${GITHUB_WORKSPACE}/build/output"
+          mkdir -p "$WORKDIR" "$OUTPUT"
+          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
+          echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
           echo "KSU_VERSION=${{ github.event.inputs.ksu_version }}" >> $GITHUB_ENV
           echo "SUSFS_VERSION=${{ github.event.inputs.susfs_version }}" >> $GITHUB_ENV
           echo "CLANG_VERSION=${{ github.event.inputs.clang_version }}" >> $GITHUB_ENV
           echo "CLEAN_BUILD=${{ github.event.inputs.clean_build }}" >> $GITHUB_ENV
-          # Expose top-level env too
           echo "KERNEL_REPO=${{ env.KERNEL_REPO }}" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=${{ env.KERNEL_BRANCH }}" >> $GITHUB_ENV
           echo "DEVICE=${{ env.DEVICE }}" >> $GITHUB_ENV
@@ -77,14 +82,20 @@ jobs:
       - name: Download Proton Clang (best-effort)
         run: |
           set -euo pipefail
+          CLANG_VERSION="${CLANG_VERSION:-18}"
           CLANG_DIR="${HOME}/proton-clang-${CLANG_VERSION}"
           mkdir -p "${CLANG_DIR}"
           PRIMARY="https://github.com/nicofork/proton-clang/releases/download/clang-${CLANG_VERSION}/proton-clang-${CLANG_VERSION}.tar.zst"
           BACKUP="https://gitlab.com/nicofork/proton-clang/-/archive/clang-${CLANG_VERSION}/proton-clang-clang-${CLANG_VERSION}.tar.gz"
           if wget -q --show-progress "${PRIMARY}" -O /tmp/clang.tar.zst 2>/dev/null; then
-            zstd -d /tmp/clang.tar.zst --stdout | tar xf - -C "${CLANG_DIR}" --strip-components=1 || true
+            if command -v zstd >/dev/null 2>&1; then
+              zstd -d /tmp/clang.tar.zst --stdout | tar xf - -C "${CLANG_DIR}" --strip-components=1
+            else
+              tar -xzf /tmp/clang.tar.zst -C "${CLANG_DIR}" --strip-components=1 2>/dev/null || true
+            fi
             rm -f /tmp/clang.tar.zst
           else
+            echo "Primary clang download failed, trying backup..."
             wget -q "${BACKUP}" -O /tmp/clang.tar.gz || true
             if [ -f /tmp/clang.tar.gz ]; then
               tar xf /tmp/clang.tar.gz -C "${CLANG_DIR}" --strip-components=1 || true
@@ -93,19 +104,20 @@ jobs:
           fi
           export PATH="${CLANG_DIR}/bin:${PATH}"
           if command -v clang >/dev/null 2>&1; then
-            clang --version | head -n1
+            echo "clang ready: $(clang --version | head -n1)"
           else
-            echo "::warning::clang not found; build may still proceed with system cross compilers if present"
+            echo "::warning::clang not found in ${CLANG_DIR}; building may use system cross-compilers"
           fi
 
       - name: Clone kernel source
         run: |
           set -euo pipefail
-          mkdir -p "$WORKDIR"
-          cd "$WORKDIR"
+          WORKDIR="${WORKDIR}"
+          cd "${WORKDIR}"
           rm -rf kernel_source
           git clone --depth=1 -b "${KERNEL_BRANCH}" "https://github.com/${KERNEL_REPO}.git" kernel_source
           cd kernel_source
+          # detect kernel root
           if [ -d "kernel_src" ]; then
             KERNEL_ROOT="kernel_src"
           elif [ -f "Makefile" ] && grep -q "^VERSION" Makefile 2>/dev/null; then
@@ -113,58 +125,62 @@ jobs:
           else
             KERNEL_ROOT="."
           fi
-          echo "KERNEL_ROOT=${KERNEL_ROOT}" >> $GITHUB_ENV
-          KVERSION=$(grep -m1 "^VERSION" Makefile | awk '{print $3}' || true)
-          KPATCHLEVEL=$(grep -m1 "^PATCHLEVEL" Makefile | awk '{print $3}' || true)
-          KSUBLEVEL=$(grep -m1 "^SUBLEVEL" Makefile | awk '{print $3}' || true)
-          echo "KERNEL_VERSION=${KVERSION:-0}.${KPATCHLEVEL:-0}.${KSUBLEVEL:-0}" >> $GITHUB_ENV
+          echo "KERNEL_ROOT=$KERNEL_ROOT"
+          echo "KERNEL_ROOT=$KERNEL_ROOT" >> $GITHUB_ENV
+          # print kernel version parts if present
+          KVERSION=$(grep -m1 "^VERSION" Makefile | awk '{print $3}' || echo "")
+          KPATCHLEVEL=$(grep -m1 "^PATCHLEVEL" Makefile | awk '{print $3}' || echo "")
+          KSUBLEVEL=$(grep -m1 "^SUBLEVEL" Makefile | awk '{print $3}' || echo "")
+          echo "KERNEL_VERSION=${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}" >> $GITHUB_ENV
 
-      - name: Integrate KernelSU-Next (best-effort)
+      - name: Integrate KernelSU (inline/manual hook)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source"
-          TMP="/tmp/ksu_next"
-          rm -rf "$TMP"
+          cd "${WORKDIR}/kernel_source"
+          TMPKSU="/tmp/ksu_next"
+          rm -rf "$TMPKSU"
           if [ "${KSU_VERSION:-latest}" = "latest" ]; then
-            git clone --depth=1 "https://github.com/KernelSU-Next/KernelSU-Next.git" "$TMP" || true
+            git clone --depth=1 "https://github.com/KernelSU-Next/KernelSU-Next.git" "$TMPKSU" || true
           else
-            git clone --depth=1 -b "${KSU_VERSION}" "https://github.com/KernelSU-Next/KernelSU-Next.git" "$TMP" || true
+            git clone --depth=1 -b "${KSU_VERSION}" "https://github.com/KernelSU-Next/KernelSU-Next.git" "$TMPKSU" || true
           fi
-          if [ -d "$TMP/kernel" ]; then
-            cp -r "$TMP/kernel" "${KERNEL_ROOT}/KernelSU" || true
-            echo "Copied KernelSU kernel files"
+          # Copy kernel integration if present, otherwise rely on defconfig injection
+          if [ -d "$TMPKSU/kernel" ]; then
+            cp -r "$TMPKSU/kernel" "${KERNEL_ROOT}/KernelSU" || true
+            echo "KernelSU kernel files copied to ${KERNEL_ROOT}/KernelSU"
           else
-            echo "No kernel/ dir in KernelSU-Next release; relying on defconfig enabling"
+            echo "No kernel/ dir in KernelSU release; will enable CONFIG_KSU via defconfig"
           fi
-          rm -rf "$TMP" || true
+          rm -rf "$TMPKSU" || true
 
-      - name: Apply SUSFS (best-effort)
+      - name: Apply SUSFS (inline/manual hook)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source"
-          TMP="/tmp/susfs_src"
-          rm -rf "$TMP"
+          cd "${WORKDIR}/kernel_source"
+          TMPSUS="/tmp/susfs_src"
+          rm -rf "$TMPSUS"
           if [ "${SUSFS_VERSION:-latest}" = "latest" ]; then
-            git clone --depth=1 "https://github.com/sidex15/susfs4ksu-module.git" "$TMP" || true
+            git clone --depth=1 "https://github.com/sidex15/susfs4ksu-module.git" "$TMPSUS" || true
           else
-            git clone --depth=1 -b "${SUSFS_VERSION}" "https://github.com/sidex15/susfs4ksu-module.git" "$TMP" || true
+            git clone --depth=1 -b "${SUSFS_VERSION}" "https://github.com/sidex15/susfs4ksu-module.git" "$TMPSUS" || true
           fi
-          if [ -d "$TMP/kernel" ]; then
-            cp -rv "$TMP/kernel/"* "${KERNEL_ROOT}/" 2>/dev/null || true
+          if [ -d "$TMPSUS/kernel" ]; then
+            cp -rv "$TMPSUS/kernel/"* "${KERNEL_ROOT}/" 2>/dev/null || true
             echo "Copied SUSFS kernel patches"
           fi
-          if [ -d "$TMP/susfs" ]; then
-            cp -rv "$TMP/susfs" "${KERNEL_ROOT}/susfs" 2>/dev/null || true
+          if [ -d "$TMPSUS/susfs" ]; then
+            cp -rv "$TMPSUS/susfs" "${KERNEL_ROOT}/susfs" 2>/dev/null || true
             echo "Copied SUSFS module"
           fi
-          rm -rf "$TMP" || true
+          rm -rf "$TMPSUS" || true
 
-      - name: Patch defconfig (enable KSU/SUSFS)
+      - name: Patch defconfig (enable KSU/SUSFS for 5.4)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source"
+          cd "${WORKDIR}/kernel_source"
           KR="${KERNEL_ROOT}"
           DEVICE="${DEVICE}"
+          # find defconfig candidates
           DEF=""
           for p in \
             "arch/arm64/configs/vendor/${DEVICE}_defconfig" \
@@ -176,84 +192,105 @@ jobs:
             if [ -f "$p" ]; then DEF="$p"; break; fi
           done
           if [ -z "$DEF" ]; then
-            DEF=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*fogos*" -o -iname "*sm6375*" \) 2>/dev/null | head -n1 || true)
+            DEF=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*fogos*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) 2>/dev/null | head -n1 || true)
           fi
           if [ -z "$DEF" ]; then
-            echo "::error::defconfig not found; aborting"
+            echo "::error::No defconfig found under arch/arm64/configs; aborting"
             exit 1
           fi
           echo "Using defconfig: $DEF"
           cp "$DEF" "${DEF}.bak" || true
-          # append KSU/SUSFS flags safely
-          printf '\n%s\n' "# KernelSU-Next + SUSFS (CI-injected)" \
+          # append safe config lines (suitable for 5.4)
+          printf '\n%s\n' "# KernelSU/SUSFS (injected by CI)" \
             "CONFIG_KSU=y" \
             "CONFIG_KPROBES=y" \
             "CONFIG_HAVE_KPROBES=y" \
-            "CONFIG_KPROBES_ON_FTRACE=y" \
-            "CONFIG_KPROBE_EVENTS=y" \
             "CONFIG_UPROBES=y" \
-            "CONFIG_UPROBE_EVENTS=y" \
-            "" \
             "CONFIG_KSU_SUSFS=y" \
-            "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" \
             "CONFIG_KSU_SUSFS_SUS_PATH=y" \
             "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
-            "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
-            "" \
             "CONFIG_MODULES=y" \
             "CONFIG_EXT4_FS=y" \
             >> "$DEF"
+          # remove duplicate lines (keep first)
           awk '!seen[$0]++ || /^#/' "$DEF" > /tmp/def.tmp || true
           mv /tmp/def.tmp "$DEF" || true
           echo "Defconfig patched."
 
-      - name: Build kernel
+      - name: Build kernel (5.4-oriented)
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source"
+          cd "${WORKDIR}/kernel_source"
           KR="${KERNEL_ROOT}"
           export PATH="${HOME}/proton-clang-${CLANG_VERSION}/bin:${PATH}"
           export CC=clang
           export ARCH=arm64
           export SUBARCH=arm64
+          # prefer system cross-compiler as fallback
           CROSS64=""
           if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then CROSS64="aarch64-linux-gnu-"; fi
-          DEF_FILE=$(find "${KR}/arch/arm64/configs" -type f \( -iname "*${DEVICE}*" -o -iname "*fogos*" -o -iname "*sm6375*" \) 2>/dev/null | head -n1 || true)
+          # choose defconfig file
+          DEF_FILE=$(find "${KR}/arch/arm64/configs" -type f \( -iname "*${DEVICE}*" -o -iname "*fogos*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) 2>/dev/null | head -n1 || true)
           if [ -z "$DEF_FILE" ]; then
             echo "::error::cannot find defconfig file to build"; exit 1
           fi
           DEF_BASENAME=$(basename "$DEF_FILE")
-          if [ "${CLEAN_BUILD}" = "true" ] || [ "${CLEAN_BUILD}" = "True" ]; then make mrproper || true; fi
+          echo "Building with defconfig: $DEF_BASENAME"
+          if [ "${CLEAN_BUILD}" = "true" ] || [ "${CLEAN_BUILD}" = "True" ]; then
+            make mrproper || true
+          fi
           make ARCH=arm64 CROSS_COMPILE=${CROSS64} "$DEF_BASENAME"
+          # compile and stream log
           make ARCH=arm64 CROSS_COMPILE=${CROSS64} -j"$(nproc)" 2>&1 | tee build.log
-          EXIT=${PIPESTATUS[0]}; if [ $EXIT -ne 0 ]; then tail -n 200 build.log; exit $EXIT; fi
-          echo "Build successful"
+          EXIT=${PIPESTATUS[0]}; if [ $EXIT -ne 0 ]; then
+            echo "::error::Build failed with exit code ${EXIT}"
+            tail -n 200 build.log || true
+            exit $EXIT
+          fi
+          echo "Kernel build completed"
 
-      - name: Collect & package
+      - name: Collect artifacts & package AnyKernel3
         run: |
           set -euo pipefail
-          cd "$WORKDIR/kernel_source"
+          cd "${WORKDIR}/kernel_source"
           KR="${KERNEL_ROOT}"
-          OUTPUT="${OUTPUTDIR}"
+          OUTPUT="${OUTPUT}"
           mkdir -p "$OUTPUT"
+          # find kernel image
           IMG=$(find "${KR}" -path "*/arch/arm64/boot/Image*" -type f 2>/dev/null | head -n1 || true)
-          if [ -z "$IMG" ]; then echo "::error::Image not found"; exit 1; fi
+          if [ -z "$IMG" ]; then echo "::error::Kernel image not found"; exit 1; fi
           cp "$IMG" "$OUTPUT/Image.gz" || cp "$IMG" "$OUTPUT/Image" || true
+          # copy dtbs
           find "${KR}" -path "*/arch/arm64/boot/dts*" -name "*.dtb" -o -name "*.dtbo" -print0 | xargs -0 -I{} cp {} "$OUTPUT/" || true
+          # minimal AnyKernel packaging
           AK="/tmp/anykernel"
-          rm -rf "$AK"; git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK" || true
+          rm -rf "$AK"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK" || true
           cp "$OUTPUT"/Image* "$AK/" 2>/dev/null || true
           cp "$OUTPUT"/*.dtb "$AK/" 2>/dev/null || true
           cd "$AK" || true
-          ZIP="kernel-${DEVICE}-$(date +%Y%m%d-%H%M).zip"
-          zip -r9 "/tmp/${ZIP}" . -x '*.git*' -x 'README.md' -x 'LICENSE' || true
-          mv "/tmp/${ZIP}" "$OUTPUT/" || true
-          sha256sum "$OUTPUT/${ZIP}" > "$OUTPUT/${ZIP}.sha256" || true
-          echo "Packaged: $OUTPUT/${ZIP}"
-          echo "ZIPPATH=$OUTPUT/${ZIP}" >> $GITHUB_ENV
+          # replace anykernel.sh minimally
+          cat > "$AK/anykernel.sh" <<'AKSH'
+##############################
+# AnyKernel3 minimal
+##############################
+properties() { '
+do.devicecheck=1
+do.systemless=1
+do.cleanup=1
+device.name1=fogos
+'; }
+. tools/ak3-core.sh || true
+AKSH
+          ZIPNAME="kernel-${DEVICE}-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "/tmp/${ZIPNAME}" . -x '*.git*' -x 'README.md' -x 'LICENSE' || true
+          mv "/tmp/${ZIPNAME}" "$OUTPUT/" || true
+          sha256sum "$OUTPUT/${ZIPNAME}" > "$OUTPUT/${ZIPNAME}.sha256" || true
+          echo "Packaged: $OUTPUT/${ZIPNAME}"
+          echo "ZIPPATH=$OUTPUT/${ZIPNAME}"
 
-      - name: Upload artifact
+      - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
         with:
           name: kernel-zip
-          path: ${{ env.OUTPUTDIR }}/*.zip
+          path: build/output/*.zip
