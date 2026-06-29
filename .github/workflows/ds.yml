@@ -104,6 +104,60 @@ jobs:
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
+      # ============================================================
+      # PERBAIKAN MANUAL UNTUK ERROR COMPILE
+      # ============================================================
+      - name: Fix SUSFS compilation errors
+        run: |
+          cd kernel_src
+
+          echo ">>> Fix 1: Tambahkan include susfs.h di fs/notify/fdinfo.c"
+          if grep -q "susfs_is_current_proc_umounted" fs/notify/fdinfo.c; then
+            sed -i '1i #include <linux/susfs.h>' fs/notify/fdinfo.c
+            echo "  Added include to fdinfo.c"
+          fi
+
+          echo ">>> Fix 2: Tambahkan include susfs.h di kernel/kallsyms.c"
+          if grep -q "susfs_starts_with" kernel/kallsyms.c; then
+            sed -i '1i #include <linux/susfs.h>' kernel/kallsyms.c
+            echo "  Added include to kallsyms.c"
+          fi
+
+          echo ">>> Fix 3: Tambahkan definisi DEFAULT_KSU_MNT_ID jika belum ada"
+          if grep -q "DEFAULT_KSU_MNT_ID" fs/notify/fdinfo.c; then
+            # Cari di kernel/KernelSU/kernel/ksu.h atau definisikan langsung
+            if ! grep -q "#define DEFAULT_KSU_MNT_ID" include/linux/susfs.h; then
+              echo "#ifndef DEFAULT_KSU_MNT_ID" >> include/linux/susfs.h
+              echo "#define DEFAULT_KSU_MNT_ID 0x01020304" >> include/linux/susfs.h
+              echo "#endif" >> include/linux/susfs.h
+              echo "  Added DEFAULT_KSU_MNT_ID to susfs.h"
+            fi
+          fi
+
+          echo ">>> Fix 4: Tambahkan fungsi susfs_starts_with jika belum ada di susfs.h"
+          if ! grep -q "susfs_starts_with" include/linux/susfs.h; then
+            cat >> include/linux/susfs.h << 'SUSFS_EOF'
+          #ifndef susfs_starts_with
+          static inline bool susfs_starts_with(const char *str, const char *prefix)
+          {
+                  while (*prefix) {
+                          if (*str != *prefix)
+                                  return false;
+                          str++;
+                          prefix++;
+                  }
+                  return true;
+          }
+          #endif
+          SUSFS_EOF
+            echo "  Added susfs_starts_with to susfs.h"
+          fi
+
+          echo ">>> Verifikasi perbaikan"
+          grep -n "susfs_is_current_proc_umounted\|DEFAULT_KSU_MNT_ID" fs/notify/fdinfo.c || echo "OK"
+          grep -n "susfs_starts_with" kernel/kallsyms.c || echo "OK"
+          grep -n "DEFAULT_KSU_MNT_ID" include/linux/susfs.h || echo "OK"
+
       - name: Generate defconfig for fogos
         run: |
           cd kernel_src
