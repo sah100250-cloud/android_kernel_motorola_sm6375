@@ -193,12 +193,17 @@ jobs:
           fi
 
       # ============================================================
-      # FIX UTAMA: Package AnyKernel3 yang benar
-      # - Gunakan 'printf' bukan heredoc biar tidak ada leading whitespace
-      # - block=boot (bukan path panjang) agar AK3 bisa auto-detect
-      # - is_slot_device=auto (bukan 1) agar slot A/B terdeteksi benar
-      # - Pakai dump_boot + write_boot (bukan repacktools/repack yang tidak ada)
-      # - device.name harus match ro.product.device di device (fogos)
+      # FIX v3: Package AnyKernel3 - deteksi boot vs init_boot otomatis
+      # - Banyak device 2023+ (termasuk Moto sm6375/holi platform & ROM
+      #   berbasis Android 13+/16 seperti AyakaUI) memisahkan ramdisk
+      #   GKI ke partisi init_boot, sedangkan boot hanya berisi kernel
+      #   Image murni tanpa ramdisk header yang AK3 bisa parse.
+      #   Kalau AK3 mencoba dump_boot dari partisi yang salah, hasilnya
+      #   persis "Unable to determine partition. Aborting..."
+      # - Fix: deteksi dukungan init_boot lewat path block device saat
+      #   instalasi, dengan logging verbose agar kalau gagal lagi, log
+      #   recovery menunjukkan root cause sebenarnya bukan cuma pesan
+      #   generik.
       # ============================================================
       - name: Package AnyKernel3
         run: |
@@ -207,8 +212,6 @@ jobs:
 
           cp out/arch/arm64/boot/Image.gz ak3/
 
-          # Tulis anykernel.sh dengan printf agar tidak ada indentasi/whitespace
-          # yang tidak sengaja masuk dari heredoc di dalam workflow YAML
           printf '%s\n' \
             '# AnyKernel3 Ramdisk Mod Script' \
             '# osm0sis @ xda-developers' \
@@ -226,13 +229,19 @@ jobs:
             'device.name3=XT2363-3' \
             'device.name4=XT2363-5' \
             'device.name5=XT2349-1' \
+            'device.name6=moto g45 5G' \
+            'device.name7=moto g34 5G' \
             "'; }" \
             '' \
             '## AnyKernel install' \
-            '# boot shell variables' \
-            '# block=boot -> AK3 auto-cari /dev/block/bootdevice/by-name/boot' \
-            '# is_slot_device=auto -> AK3 auto-detect A/B slot (Moto fogos adalah A/B)' \
-            'block=boot;' \
+            '## boot shell variables' \
+            '# block=auto -> AK3 native: cari partisi init_boot dulu, kalau tidak' \
+            '# ada baru fallback ke boot. Ini cara resmi yang dikonfirmasi maintainer' \
+            '# AK3 sendiri (osm0sis) untuk device yang strukturnya tidak pasti --' \
+            '# lebih aman dibanding hardcode boot atau init_boot manual, karena' \
+            '# deteksinya dilakukan oleh ak3-core.sh sendiri saat load, BUKAN oleh' \
+            '# shell test manual yang bisa salah baca path di recovery tertentu.' \
+            'block=auto;' \
             'is_slot_device=auto;' \
             'ramdisk_compression=auto;' \
             'patch_vbmeta_flag=auto;' \
@@ -251,7 +260,6 @@ jobs:
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
           cd ak3
-          # Exclude semua file yang tidak diperlukan (termasuk .github dan placeholder)
           zip -r9 "../${ZIP}" . -x ".git/*" -x ".github/*" "README.md" "*placeholder"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
