@@ -73,13 +73,8 @@ jobs:
           echo ">>> Fix 3: Create linux/pgtable.h compat wrapper (fallback)"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
-            cat > include/linux/pgtable.h << 'HEOF'
-/* Compatibility wrapper for kernel < 5.8 */
-#ifndef _LINUX_PGTABLE_COMPAT_H
-#define _LINUX_PGTABLE_COMPAT_H
-#include <asm/pgtable.h>
-#endif
-HEOF
+            printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
+              > include/linux/pgtable.h
             echo "  Created include/linux/pgtable.h compat wrapper"
           fi
 
@@ -184,7 +179,7 @@ HEOF
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             LLVM=1 \
             LLVM_IAS=1 \
-            Image.gz dtbs 2>&1 | tee ../build.log
+            Image.gz 2>&1 | tee ../build.log
 
           if [ -f ../out/arch/arm64/boot/Image.gz ]; then
             echo "=============================="
@@ -197,58 +192,73 @@ HEOF
             exit 1
           fi
 
+      # ============================================================
+      # FIX UTAMA: Package AnyKernel3 yang benar
+      # - Gunakan 'printf' bukan heredoc biar tidak ada leading whitespace
+      # - block=boot (bukan path panjang) agar AK3 bisa auto-detect
+      # - is_slot_device=auto (bukan 1) agar slot A/B terdeteksi benar
+      # - Pakai dump_boot + write_boot (bukan repacktools/repack yang tidak ada)
+      # - device.name harus match ro.product.device di device (fogos)
+      # ============================================================
       - name: Package AnyKernel3
         run: |
           git clone --depth=1 \
             https://github.com/osm0sis/AnyKernel3.git ak3
 
-          # Copy kernel image
           cp out/arch/arm64/boot/Image.gz ak3/
 
-          # Copy DTB jika tersedia (untuk mencegah bootloop di beberapa ROM)
-          find out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null | \
-            head -1 | xargs -I{} cp {} ak3/dtb 2>/dev/null || true
+          # Tulis anykernel.sh dengan printf agar tidak ada indentasi/whitespace
+          # yang tidak sengaja masuk dari heredoc di dalam workflow YAML
+          printf '%s\n' \
+            '# AnyKernel3 Ramdisk Mod Script' \
+            '# osm0sis @ xda-developers' \
+            '' \
+            '## AnyKernel setup' \
+            "properties() { '" \
+            'kernel.string=RKSU + SUSFS | fogos | AyakaUI' \
+            'do.devicecheck=1' \
+            'do.modules=0' \
+            'do.systemless=1' \
+            'do.cleanup=1' \
+            'do.cleanuponabort=0' \
+            'device.name1=fogos' \
+            'device.name2=XT2363-2' \
+            'device.name3=XT2363-3' \
+            'device.name4=XT2363-5' \
+            'device.name5=XT2349-1' \
+            "'; }" \
+            '' \
+            '## AnyKernel install' \
+            '# boot shell variables' \
+            '# block=boot -> AK3 auto-cari /dev/block/bootdevice/by-name/boot' \
+            '# is_slot_device=auto -> AK3 auto-detect A/B slot (Moto fogos adalah A/B)' \
+            'block=boot;' \
+            'is_slot_device=auto;' \
+            'ramdisk_compression=auto;' \
+            'patch_vbmeta_flag=auto;' \
+            '' \
+            '# import functions - DO NOT REMOVE' \
+            '. tools/ak3-core.sh;' \
+            '' \
+            '## boot install' \
+            'dump_boot;' \
+            'write_boot;' \
+            > ak3/anykernel.sh
 
-          # Tulis anykernel.sh TANPA indentasi di dalam HEREDOC
-          # Ini kunci utama agar AnyKernel3 bisa parse block= dan device check
-          cat > ak3/anykernel.sh << 'AKEOF'
-# AnyKernel3 - fogos | RKSU + SUSFS | Android 16
-# Moto G34 5G / Moto G45 5G (SM6375)
-# by osm0sis @ xda-developers
-
-properties() { '
-kernel.string=RKSU + SUSFS | fogos | AyakaUI
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=0
-device.name1=fogos
-device.name2=XT2363-2
-device.name3=XT2363-3
-device.name4=XT2363-5
-device.name5=XT2349-1
-device.name6=moto g45 5G
-device.name7=moto g34 5G
-'; }
-
-block=/dev/block/bootdevice/by-name/boot
-is_slot_device=1
-ramdisk_compression=auto
-patch_vbmeta_flag=auto
-
-. tools/ak3-core.sh
-dump_boot
-write_boot
-AKEOF
+          echo "=== Verifikasi anykernel.sh ==="
+          cat ak3/anykernel.sh
 
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
           cd ak3
-          zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
+          # Exclude semua file yang tidak diperlukan (termasuk .github dan placeholder)
+          zip -r9 "../${ZIP}" . -x ".git/*" -x ".github/*" "README.md" "*placeholder"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
           ls -lh "${ZIP}"
+
+          echo "=== Verifikasi isi ZIP ==="
+          unzip -l "${ZIP}" | head -20
 
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
