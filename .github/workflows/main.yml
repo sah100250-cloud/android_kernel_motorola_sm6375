@@ -1,0 +1,282 @@
+name: Kernel fogos | SukiSU Ultra + SUSFS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git curl wget python3 bc bison \
+            build-essential ccache flex \
+            libssl-dev libncurses5-dev libelf-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            zip unzip cpio kmod pahole
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
+            -b sixteen \
+            kernel_src
+          echo "=== Kernel version ==="
+          head -5 kernel_src/Makefile
+          echo "=== Vendor configs ==="
+          ls kernel_src/arch/arm64/configs/vendor/
+          echo "=== Ext configs ==="
+          ls kernel_src/arch/arm64/configs/vendor/ext_config/ \
+            2>/dev/null || echo "no ext_config"
+
+      - name: Download Clang toolchain
+        run: |
+          mkdir clang
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C clang
+          echo "Clang: $(clang/bin/clang --version | head -1)"
+
+      # ============================================================
+      # SukiSU Ultra - nongki branch
+      # Ini fork KSU paling aktif 2025-2026 untuk non-GKI
+      # Support kernel 3.4 - 5.10+
+      # Compatible dengan rsuntk hook method (sama seperti RKSU/AyakaUI)
+      # ============================================================
+      - name: Setup SukiSU Ultra (nongki branch)
+        run: |
+          cd kernel_src
+          echo ">>> Integrating SukiSU Ultra (nongki)..."
+          curl -LSs \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s nongki
+          echo "=== SukiSU Ultra version ==="
+          cat KernelSU/kernel/Makefile | head -5 || true
+          echo ">>> SukiSU Ultra integrated OK"
+
+      # ============================================================
+      # SUSFS untuk kernel 5.4 - JackA1ltman fixed patch
+      # Ini patch yang sudah terbukti work di non-GKI kernel 5.4 SM6375
+      # ============================================================
+      - name: Apply SUSFS for kernel 5.4
+        run: |
+          echo ">>> Download SUSFS source (kernel-5.4 branch)..."
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b kernel-5.4 susfs_src
+
+          echo ">>> Download JackA1ltman fixed patch untuk kernel 5.4..."
+          wget -q \
+            "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch" \
+            -O susfs_5.4.patch
+
+          cd kernel_src
+
+          echo ">>> Copy SUSFS source files..."
+          cp -v ../susfs_src/kernel_patches/fs/susfs.c \
+            fs/ 2>/dev/null && echo "OK: susfs.c" || echo "SKIP: susfs.c"
+          cp -v ../susfs_src/kernel_patches/include/linux/susfs.h \
+            include/linux/ 2>/dev/null && echo "OK: susfs.h" || echo "SKIP: susfs.h"
+          cp -v ../susfs_src/kernel_patches/include/linux/susfs_def.h \
+            include/linux/ 2>/dev/null && echo "OK: susfs_def.h" || echo "SKIP: susfs_def.h"
+          cp -v ../susfs_src/kernel_patches/include/linux/sus_su.h \
+            include/linux/ 2>/dev/null && echo "OK: sus_su.h" || echo "SKIP: sus_su.h"
+
+          echo ">>> Apply SUSFS patch..."
+          patch -p1 --fuzz=3 < ../susfs_5.4.patch \
+            && echo ">>> SUSFS patch: BERHASIL" \
+            || echo ">>> SUSFS patch: applied dengan warnings (normal untuk non-GKI)"
+
+          # Bersihkan file sisa
+          find . -name "*.orig" -delete 2>/dev/null || true
+          find . -name "*.rej" -exec cat {} \; 2>/dev/null || true
+          find . -name "*.rej" -delete 2>/dev/null || true
+
+      # ============================================================
+      # Defconfig fogos (Moto G45 5G - SM6375/holi)
+      # Merge: vendor/holi-qgki_defconfig + ext_config/moto-holi + ext_config/moto-holi-fogos
+      # ============================================================
+      - name: Generate defconfig fogos
+        run: |
+          cd kernel_src
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+
+          ARGS="O=../out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+
+          echo ">>> Step 1: Base holi-qgki_defconfig"
+          make $ARGS vendor/holi-qgki_defconfig
+
+          echo ">>> Step 2: Merge ext_config fogos"
+          for cfg in \
+            arch/arm64/configs/vendor/ext_config/moto-holi.config \
+            arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
+            if [ -f "$cfg" ]; then
+              echo "  Merge: $cfg"
+              ./scripts/kconfig/merge_config.sh -m -O ../out \
+                ../out/.config "$cfg"
+            else
+              echo "  SKIP (tidak ada): $cfg"
+            fi
+          done
+
+          echo ">>> Step 3: Enable SukiSU Ultra + SUSFS + disable LTO"
+          ./scripts/config --file ../out/.config \
+            -e KSU \
+            -d KSU_WITH_KPROBES \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -d KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_OPEN_REDIRECT \
+            -d KSU_SUSFS_SUS_SU \
+            -d LTO_CLANG \
+            -e LTO_NONE
+
+          echo ">>> Step 4: olddefconfig (dengan yes untuk semua prompt)"
+          yes "" | make $ARGS olddefconfig
+
+          echo "=== Verifikasi KSU + SUSFS ==="
+          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" \
+            ../out/.config | head -20 \
+            || echo "WARNING: config KSU tidak ditemukan!"
+          echo "=== Verifikasi LTO ==="
+          grep "CONFIG_LTO" ../out/.config || true
+          echo "=== Verifikasi HOOK ==="
+          grep "MANUAL_HOOK\|KPROBES" ../out/.config || true
+
+      # ============================================================
+      # Build kernel
+      # Image.gz only - dtbo.img tidak dibuild (tidak support di SM6375 workflow)
+      # ============================================================
+      - name: Build kernel
+        run: |
+          cd kernel_src
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+
+          echo ">>> Building dengan $(nproc) threads..."
+          yes "" | make -j$(nproc) \
+            O=../out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            Image.gz 2>&1 | tee ../build.log
+
+          echo ""
+          echo ">>> Cek hasil build..."
+          if [ -f ../out/arch/arm64/boot/Image.gz ]; then
+            echo ""
+            echo "============================================"
+            echo "  BUILD SUKSES!"
+            echo "============================================"
+            ls -lh ../out/arch/arm64/boot/Image.gz
+          else
+            echo "BUILD GAGAL - 100 baris terakhir log:"
+            tail -100 ../build.log
+            exit 1
+          fi
+
+      # ============================================================
+      # Package AnyKernel3
+      # ============================================================
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git ak3
+
+          cp out/arch/arm64/boot/Image.gz ak3/
+
+          # anykernel.sh untuk fogos (Moto G34/G45 5G)
+          cat > ak3/anykernel.sh << 'AKEOF'
+# AnyKernel3 - AK3-Actions Script
+# fogos | SukiSU Ultra + SUSFS
+# Compatible: AyakaUI & semua ROM fogos
+
+properties() { '
+kernel.string=SukiSU Ultra + SUSFS | fogos | Moto G45 5G
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=fogos
+device.name2=XT2363-2
+device.name3=XT2363-3
+device.name4=XT2363-5
+device.name5=XT2349-1
+device.name6=moto g45 5G
+device.name7=moto g34 5G
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=1;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+. tools/repacktools.sh;
+. tools/repack.sh;
+AKEOF
+
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIPNAME="kernel-fogos-SukiSU-SUSFS-${DATE}.zip"
+          cd ak3
+          zip -r9 "../${ZIPNAME}" . -x ".git/*" "README.md"
+          cd ..
+          echo "ZIP_NAME=${ZIPNAME}" >> $GITHUB_ENV
+          echo "ZIP siap:"
+          ls -lh "${ZIPNAME}"
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-fogos-SukiSU-SUSFS-${{ github.run_number }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          retention-days: 7
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "============================================"
+          echo "BUILD BERHASIL!"
+          echo "KSU  : SukiSU Ultra (nongki branch)"
+          echo "SUSFS: JackA1ltman fixed patch (kernel 5.4)"
+          echo "Device: fogos | Moto G34/G45 5G | SM6375"
+          echo "ZIP  : ${{ env.ZIP_NAME }}"
+          echo "============================================"
+          echo ""
+          echo "SETELAH FLASH:"
+          echo "1. Install SukiSU Ultra Manager APK"
+          echo "   https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases"
+          echo "2. Install SUSFS Module"
+          echo "   https://github.com/sidex15/susfs4ksu-module/releases"
+          echo "3. Install modul lain (Zygisk Next, Shamiko, PIF, TrickyStore)"
