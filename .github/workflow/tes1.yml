@@ -1,0 +1,267 @@
+name: Kernel fogos | RKSU + SUSFS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git curl wget python3 bc bison \
+            build-essential ccache flex \
+            libssl-dev libncurses5-dev libelf-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            zip unzip cpio kmod pahole
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
+            -b sixteen \
+            kernel_src
+          echo "=== Kernel version ==="
+          head -5 kernel_src/Makefile
+
+      - name: Download Clang toolchain
+        run: |
+          mkdir clang
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C clang
+          echo "Clang: $(clang/bin/clang --version | head -1)"
+
+      - name: Setup RKSU (rsuntk/KernelSU - non-GKI compatible)
+        run: |
+          cd kernel_src
+          curl -LSs \
+            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
+            | bash -s main
+          echo "=== RKSU version ==="
+          cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3
+
+      - name: Fix kernel 5.4 compatibility issues
+        run: |
+          cd kernel_src
+
+          echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
+          find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
+            xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
+              sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
+              echo "  Fixed pgtable.h: $f"
+            done
+
+          echo ">>> Fix 2: sulog.h missing linux/init.h"
+          SULOG="drivers/kernelsu/feature/sulog.h"
+          if [ -f "$SULOG" ]; then
+            if ! grep -q "linux/init.h" "$SULOG"; then
+              sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
+              echo "  Fixed sulog.h: added linux/init.h"
+            else
+              echo "  sulog.h: already has init.h"
+            fi
+          fi
+
+          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper (fallback)"
+          mkdir -p include/linux
+          if [ ! -f "include/linux/pgtable.h" ]; then
+            cat > include/linux/pgtable.h << 'HEOF'
+/* Compatibility wrapper for kernel < 5.8 */
+#ifndef _LINUX_PGTABLE_COMPAT_H
+#define _LINUX_PGTABLE_COMPAT_H
+#include <asm/pgtable.h>
+#endif
+HEOF
+            echo "  Created include/linux/pgtable.h compat wrapper"
+          fi
+
+          echo ">>> Verifikasi fixes..."
+          grep -r "linux/pgtable.h" drivers/kernelsu/ 2>/dev/null \
+            && echo "WARNING: masih ada pgtable.h" \
+            || echo "pgtable.h OK - tidak ada lagi"
+
+      - name: Apply SUSFS patch for kernel 5.4
+        run: |
+          wget -q \
+            https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
+            -O susfs_patch.patch
+
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b kernel-5.4 susfs_src
+
+          cd kernel_src
+
+          cp ../susfs_src/kernel_patches/fs/susfs.c \
+            fs/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/susfs.h \
+            include/linux/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/susfs_def.h \
+            include/linux/ 2>/dev/null || true
+          cp ../susfs_src/kernel_patches/include/linux/sus_su.h \
+            include/linux/ 2>/dev/null || true
+
+          patch -p1 --fuzz=3 < ../susfs_patch.patch \
+            && echo "SUSFS patch: OK" \
+            || echo "SUSFS patch: applied with warnings"
+
+          find . -name "*.orig" -delete 2>/dev/null || true
+          find . -name "*.rej" -delete 2>/dev/null || true
+
+      - name: Generate defconfig for fogos
+        run: |
+          cd kernel_src
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+
+          MAKE_ARGS="O=../out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+
+          echo ">>> Step 1: Base holi-qgki defconfig"
+          make $MAKE_ARGS vendor/holi-qgki_defconfig
+
+          echo ">>> Step 2: Merge fogos ext configs"
+          for cfg in \
+            arch/arm64/configs/vendor/ext_config/moto-holi.config \
+            arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
+            if [ -f "$cfg" ]; then
+              echo "  Merging: $cfg"
+              ./scripts/kconfig/merge_config.sh \
+                -m -O ../out ../out/.config "$cfg"
+            fi
+          done
+
+          echo ">>> Step 3: Set KSU + SUSFS + LTO configs"
+          ./scripts/config --file ../out/.config \
+            -e KSU \
+            -d KSU_WITH_KPROBES \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -d KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_OPEN_REDIRECT \
+            -d KSU_SUSFS_SUS_SU \
+            -e LTO_NONE \
+            -d LTO_CLANG \
+            -e RELR
+
+          echo ">>> Step 4: olddefconfig"
+          yes "" | make $MAKE_ARGS olddefconfig
+
+          echo "=== Config check ==="
+          grep "CONFIG_KSU" ../out/.config || echo "WARNING: KSU missing!"
+          grep "CONFIG_KSU_SUSFS" ../out/.config | head -3
+          grep "CONFIG_LTO" ../out/.config
+
+      - name: Build kernel
+        run: |
+          cd kernel_src
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+
+          echo ">>> Building dengan $(nproc) threads..."
+          yes "" | make -j$(nproc) \
+            O=../out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            Image.gz dtbs 2>&1 | tee ../build.log
+
+          if [ -f ../out/arch/arm64/boot/Image.gz ]; then
+            echo "=============================="
+            echo "BUILD SUCCESS!"
+            ls -lh ../out/arch/arm64/boot/Image.gz
+            echo "=============================="
+          else
+            echo "BUILD FAILED - Last 100 lines:"
+            tail -100 ../build.log
+            exit 1
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git ak3
+
+          # Copy kernel image
+          cp out/arch/arm64/boot/Image.gz ak3/
+
+          # Copy DTB jika tersedia (untuk mencegah bootloop di beberapa ROM)
+          find out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null | \
+            head -1 | xargs -I{} cp {} ak3/dtb 2>/dev/null || true
+
+          # Tulis anykernel.sh TANPA indentasi di dalam HEREDOC
+          # Ini kunci utama agar AnyKernel3 bisa parse block= dan device check
+          cat > ak3/anykernel.sh << 'AKEOF'
+# AnyKernel3 - fogos | RKSU + SUSFS | Android 16
+# Moto G34 5G / Moto G45 5G (SM6375)
+# by osm0sis @ xda-developers
+
+properties() { '
+kernel.string=RKSU + SUSFS | fogos | AyakaUI
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=fogos
+device.name2=XT2363-2
+device.name3=XT2363-3
+device.name4=XT2363-5
+device.name5=XT2349-1
+device.name6=moto g45 5G
+device.name7=moto g34 5G
+'; }
+
+block=/dev/block/bootdevice/by-name/boot
+is_slot_device=1
+ramdisk_compression=auto
+patch_vbmeta_flag=auto
+
+. tools/ak3-core.sh
+dump_boot
+write_boot
+AKEOF
+
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
+          cd ak3
+          zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
+          cd ..
+          echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
+          ls -lh "${ZIP}"
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-fogos-rksu-susfs-${{ github.run_number }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          retention-days: 7
