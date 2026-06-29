@@ -39,22 +39,12 @@ permissions:
 
 jobs:
   build:
-    name: Build & Package Kernel (${{ env.DEVICE }})
+    name: Build and Package Kernel (fogos)
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      KSU_VERSION: ${{ github.event.inputs.ksu_version }}
-      SUSFS_VERSION: ${{ github.event.inputs.susfs_version }}
-      CLANG_VERSION: ${{ github.event.inputs.clang_version }}
-      CLEAN_BUILD: ${{ github.event.inputs.clean_build }}
-      KERNEL_REPO: ${{ env.KERNEL_REPO }}
-      KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
-      DEVICE: ${{ env.DEVICE }}
-      WORKDIR: ${{ runner.temp }}/kernel_build
-      OUTPUTDIR: ${{ runner.temp }}/kernel_output
 
     steps:
-      - name: Checkout (empty)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -69,12 +59,20 @@ jobs:
             device-tree-compiler zstd libelf-dev libudev-dev \
             wget curl git
 
-      - name: Prepare work dirs
+      - name: Set runner environment variables
         run: |
-          mkdir -p "$WORKDIR"
-          mkdir -p "$OUTPUTDIR"
-          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
-          echo "OUTPUTDIR=$OUTPUTDIR" >> $GITHUB_ENV
+          # WORKDIR and OUTPUTDIR based on runner-provided temp dir
+          echo "WORKDIR=${RUNNER_TEMP}/kernel_build" >> $GITHUB_ENV
+          echo "OUTPUTDIR=${RUNNER_TEMP}/kernel_output" >> $GITHUB_ENV
+          # Inputs -> env for use in later steps
+          echo "KSU_VERSION=${{ github.event.inputs.ksu_version }}" >> $GITHUB_ENV
+          echo "SUSFS_VERSION=${{ github.event.inputs.susfs_version }}" >> $GITHUB_ENV
+          echo "CLANG_VERSION=${{ github.event.inputs.clang_version }}" >> $GITHUB_ENV
+          echo "CLEAN_BUILD=${{ github.event.inputs.clean_build }}" >> $GITHUB_ENV
+          # Expose top-level env too
+          echo "KERNEL_REPO=${{ env.KERNEL_REPO }}" >> $GITHUB_ENV
+          echo "KERNEL_BRANCH=${{ env.KERNEL_BRANCH }}" >> $GITHUB_ENV
+          echo "DEVICE=${{ env.DEVICE }}" >> $GITHUB_ENV
 
       - name: Download Proton Clang (best-effort)
         run: |
@@ -84,7 +82,7 @@ jobs:
           PRIMARY="https://github.com/nicofork/proton-clang/releases/download/clang-${CLANG_VERSION}/proton-clang-${CLANG_VERSION}.tar.zst"
           BACKUP="https://gitlab.com/nicofork/proton-clang/-/archive/clang-${CLANG_VERSION}/proton-clang-clang-${CLANG_VERSION}.tar.gz"
           if wget -q --show-progress "${PRIMARY}" -O /tmp/clang.tar.zst 2>/dev/null; then
-            zstd -d /tmp/clang.tar.zst --stdout | tar xf - -C "${CLANG_DIR}" --strip-components=1
+            zstd -d /tmp/clang.tar.zst --stdout | tar xf - -C "${CLANG_DIR}" --strip-components=1 || true
             rm -f /tmp/clang.tar.zst
           else
             wget -q "${BACKUP}" -O /tmp/clang.tar.gz || true
@@ -97,12 +95,13 @@ jobs:
           if command -v clang >/dev/null 2>&1; then
             clang --version | head -n1
           else
-            echo "::warning::clang not found; build may fail if clang is required"
+            echo "::warning::clang not found; build may still proceed with system cross compilers if present"
           fi
 
       - name: Clone kernel source
         run: |
           set -euo pipefail
+          mkdir -p "$WORKDIR"
           cd "$WORKDIR"
           rm -rf kernel_source
           git clone --depth=1 -b "${KERNEL_BRANCH}" "https://github.com/${KERNEL_REPO}.git" kernel_source
@@ -135,7 +134,7 @@ jobs:
             cp -r "$TMP/kernel" "${KERNEL_ROOT}/KernelSU" || true
             echo "Copied KernelSU kernel files"
           else
-            echo "No kernel/ dir in KernelSU-Next release; will rely on defconfig enabling"
+            echo "No kernel/ dir in KernelSU-Next release; relying on defconfig enabling"
           fi
           rm -rf "$TMP" || true
 
@@ -185,8 +184,8 @@ jobs:
           fi
           echo "Using defconfig: $DEF"
           cp "$DEF" "${DEF}.bak" || true
-          # append lines safely with printf
-          printf '%s\n' "" "# KernelSU-Next + SUSFS (CI-injected)" \
+          # append KSU/SUSFS flags safely
+          printf '\n%s\n' "# KernelSU-Next + SUSFS (CI-injected)" \
             "CONFIG_KSU=y" \
             "CONFIG_KPROBES=y" \
             "CONFIG_HAVE_KPROBES=y" \
@@ -204,7 +203,6 @@ jobs:
             "CONFIG_MODULES=y" \
             "CONFIG_EXT4_FS=y" \
             >> "$DEF"
-          # dedupe lines (keep first occurrences)
           awk '!seen[$0]++ || /^#/' "$DEF" > /tmp/def.tmp || true
           mv /tmp/def.tmp "$DEF" || true
           echo "Defconfig patched."
@@ -236,7 +234,7 @@ jobs:
           set -euo pipefail
           cd "$WORKDIR/kernel_source"
           KR="${KERNEL_ROOT}"
-          OUTPUT="$OUTPUTDIR"
+          OUTPUT="${OUTPUTDIR}"
           mkdir -p "$OUTPUT"
           IMG=$(find "${KR}" -path "*/arch/arm64/boot/Image*" -type f 2>/dev/null | head -n1 || true)
           if [ -z "$IMG" ]; then echo "::error::Image not found"; exit 1; fi
