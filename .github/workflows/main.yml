@@ -1,4 +1,4 @@
-name: Build Kernel — Moto G45 5G (resilient single-file)
+name: Build Kernel — Moto G45 5G (final single-file)
 
 on:
   workflow_dispatch:
@@ -66,8 +66,12 @@ jobs:
 
       - name: Prepare inputs (save to GITHUB_ENV)
         run: |
-          echo "WORKDIR=${GITHUB_WORKSPACE}/build" >> $GITHUB_ENV
-          echo "OUTPUT=${GITHUB_WORKSPACE}/build/output" >> $GITHUB_ENV
+          set -euo pipefail
+          WORKDIR="${GITHUB_WORKSPACE}/build"
+          OUTPUT="${GITHUB_WORKSPACE}/build/output"
+          mkdir -p "$WORKDIR" "$OUTPUT"
+          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
+          echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
           echo "KERNEL_REPO=${{ github.event.inputs.kernel_repo }}" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_ENV
           echo "KSU_VERSION=${{ github.event.inputs.ksu_version }}" >> $GITHUB_ENV
@@ -80,7 +84,6 @@ jobs:
         run: |
           set -euo pipefail
           WORKDIR="${WORKDIR}"
-          mkdir -p "$WORKDIR"
           cd "$WORKDIR"
           rm -rf kernel_source || true
 
@@ -118,31 +121,32 @@ jobs:
           done
 
           if [ $success -eq 0 ]; then
-            echo "Tarball failed; trying non-interactive git clone (public repos only)"
+            echo "Tarball downloads failed; attempting non-interactive git clone (public repos only)"
             export GIT_TERMINAL_PROMPT=0
             if git clone --depth=1 --branch "$BRANCH" "https://github.com/${OWNER}/${NAME}.git" kernel_source 2>/tmp/clone.err; then
               echo "git clone succeeded"
               success=1
             else
-              echo "git clone failed:"
+              echo "git clone failed (see snippet):"
               sed -n '1,200p' /tmp/clone.err || true
             fi
           fi
 
           if [ $success -eq 0 ]; then
-            echo "Fetch failed; falling back to workflow repository as kernel_source"
+            echo "All attempts to fetch ${REPO}@${BRANCH} failed; falling back to workflow repo contents"
             mkdir -p kernel_source
+            # copy workflow repo contents (best-effort)
             cp -r "${GITHUB_WORKSPACE}/." kernel_source || true
             success=1
           fi
 
           if [ $success -ne 1 ]; then
-            echo "::error::Unable to obtain kernel source for ${REPO}@${BRANCH}"
+            echo "::error::Failed to obtain kernel source"
             exit 1
           fi
 
-          echo "Kernel source ready at $WORKDIR/kernel_source"
-          ls -la kernel_source | head -n 20
+          echo "Kernel source prepared at: $WORKDIR/kernel_source"
+          ls -la kernel_source | head -n 40
 
       - name: Download Proton Clang (best-effort)
         run: |
@@ -160,9 +164,9 @@ jobs:
             fi
             rm -f /tmp/clang.tar.zst
             export PATH="$CLANG_DIR/bin:$PATH"
-            echo "Proton Clang put in $CLANG_DIR"
+            echo "Proton Clang installed to $CLANG_DIR"
           else
-            echo "Proton Clang not available; using system cross compilers"
+            echo "Proton Clang unavailable; will fallback to system cross compilers"
           fi
 
       - name: Integrate KernelSU-Next (best-effort)
@@ -178,9 +182,9 @@ jobs:
           fi
           if [ -d "$TMPKSU/kernel" ]; then
             cp -r "$TMPKSU/kernel" ./KernelSU || true
-            echo "KernelSU copied"
+            echo "KernelSU files copied"
           else
-            echo "No KernelSU kernel dir; will rely on defconfig injection"
+            echo "KernelSU kernel dir not present; will rely on defconfig injection"
           fi
           rm -rf "$TMPKSU" || true
 
@@ -197,10 +201,11 @@ jobs:
           fi
           if [ -d "$TMPSUS/kernel" ]; then
             cp -rv "$TMPSUS/kernel/"* . 2>/dev/null || true
-            echo "SUSFS patches copied"
+            echo "SUSFS kernel patches copied"
           fi
           if [ -d "$TMPSUS/susfs" ]; then
             cp -rv "$TMPSUS/susfs" ./susfs 2>/dev/null || true
+            echo "SUSFS module copied"
           fi
           rm -rf "$TMPSUS" || true
 
@@ -242,38 +247,80 @@ jobs:
             echo "::warning::No defconfig found; build may fail"
           fi
 
-      - name: Build kernel (attempt)
+      - name: Build kernel (robust detection & defconfig)
         run: |
           set -euo pipefail
           cd "${WORKDIR}/kernel_source" || exit 1
-          if [ -d "kernel_src" ]; then cd kernel_src; fi
-          export ARCH=arm64
-          export SUBARCH=arm64
-          if command -v clang >/dev/null 2>&1; then
-            export CC=clang
-            echo "Building with clang"
-          elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            export CROSS_COMPILE=aarch64-linux-gnu-
-            echo "Building with aarch64-linux-gnu-"
+
+          # --- locate kernel Makefile (with VERSION) ---
+          KROOT=""
+          if [ -f Makefile ] && grep -m1 -E '^VERSION' Makefile >/dev/null 2>&1; then
+            KROOT="."
+          elif [ -f kernel_src/Makefile ] && grep -m1 -E '^VERSION' kernel_src/Makefile >/dev/null 2>&1; then
+            KROOT="kernel_src"
           else
-            echo "::error::No compiler available (clang or aarch64-linux-gnu-gcc)"
+            candidate=$(find . -maxdepth 3 -type f -name Makefile -exec grep -l -m1 -E '^VERSION' {} \; 2>/dev/null | head -n1 || true)
+            if [ -n "$candidate" ]; then
+              KROOT=$(dirname "$candidate")
+            fi
+          fi
+
+          if [ -z "$KROOT" ]; then
+            echo "::error::Could not find kernel Makefile with VERSION; listing tree for debug:"
+            ls -la || true
             exit 1
           fi
+
+          echo "Kernel root: $KROOT"
+          cd "$KROOT" || exit 1
+          echo "PWD: $(pwd)"
+          ls -la | sed -n '1,200p'
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          if command -v clang >/dev/null 2>&1; then
+            export CC=clang
+            echo "Using clang"
+          elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            echo "Using aarch64-linux-gnu- cross compiler"
+          else
+            echo "::error::No suitable compiler (clang or aarch64-linux-gnu-gcc)"
+            exit 1
+          fi
+
+          # find defconfig (if any)
           DEF_FILE=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) 2>/dev/null | head -n1 || true)
+
           if [ -n "$DEF_FILE" ]; then
             DEFBASE=$(basename "$DEF_FILE")
-            if [ "${CLEAN_BUILD}" = "true" ] || [ "${CLEAN_BUILD}" = "True" ]; then
-              make ARCH=arm64 mrproper || true
+            echo "Found defconfig: $DEF_FILE (target: $DEFBASE)"
+            # try make <defconfig> target (some trees expect exact name)
+            if make ARCH=arm64 "$DEFBASE"; then
+              echo "make $DEFBASE: OK"
+            else
+              echo "make $DEFBASE failed or target not present; falling back to 'make defconfig'"
+              make ARCH=arm64 defconfig || true
             fi
-            make ARCH=arm64 "$DEFBASE"
+          else
+            echo "::warning::No defconfig found; attempting make defconfig"
+            make ARCH=arm64 defconfig || true
           fi
+
+          if [ ! -f .config ]; then
+            echo "::error::.config missing after defconfig step; aborting (listing configs)"
+            ls -la arch/arm64/configs | sed -n '1,200p' || true
+            exit 1
+          fi
+
           make ARCH=arm64 -j"$(nproc)" 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
-            echo "::error::Build failed (exit $rc). See build.log artifact."
+            echo "::error::Kernel build failed (exit $rc)"
             exit $rc
           fi
-          echo "Build finished."
+          echo "Kernel build succeeded."
 
       - name: Upload build log (always)
         uses: actions/upload-artifact@v4
