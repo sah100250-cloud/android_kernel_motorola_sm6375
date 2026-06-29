@@ -1,4 +1,4 @@
-name: Kernel fogos | KSU-Next + SUSFS
+name: Kernel fogos | SukiSU Ultra + SUSFS (non-GKI)
 
 on:
   workflow_dispatch:
@@ -29,9 +29,9 @@ jobs:
             kernel_src
           echo "=== Kernel version ==="
           head -5 kernel_src/Makefile
-          echo "=== Available configs ==="
+          echo "=== Available vendor configs ==="
           ls kernel_src/arch/arm64/configs/vendor/
-          echo "=== Ext configs ==="
+          echo "=== Available ext_configs ==="
           ls kernel_src/arch/arm64/configs/vendor/ext_config/ \
             2>/dev/null || echo "no ext_config dir"
 
@@ -44,49 +44,36 @@ jobs:
           tar -xf clang.tar.gz -C clang
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
-      - name: Setup KernelSU-Next (legacy branch for non-GKI 5.4)
+      # ---- PERUBAHAN UTAMA: SukiSU Ultra, bukan KernelSU-Next ----
+      # susfs-main = branch yang sudah include SUSFS built-in,
+      # tidak perlu manual patch .patch file (sumber masalah build sebelumnya)
+      - name: Setup SukiSU Ultra (susfs-main, non-GKI)
         run: |
           cd kernel_src
-          # Pakai legacy branch - ini yang support non-GKI kernel 5.4
-          # Branch 'next' punya bug sulog.h untuk non-GKI
+          echo ">>> Integrating SukiSU Ultra with built-in SUSFS..."
           curl -LSs \
-            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
-            | bash -s legacy
-          echo "=== KSU-Next version ==="
-          cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" | head -3
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s susfs-main
+          echo "=== SukiSU version ==="
+          cat KernelSU/kernel/Makefile | grep -i "VERSION\|PATCHLEVEL\|SUBLEVEL" | head -5
 
-      - name: Apply SUSFS patch for kernel 5.4
+      - name: Validate hook integration (fast-fail, biar gak nunggu 1 jam kalau gagal)
         run: |
-          # Download fixed SUSFS patch untuk kernel 5.4 non-GKI
-          wget -q \
-            https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
-            -O susfs_patch.patch
-
-          # Clone SUSFS source files
-          git clone --depth=1 \
-            https://gitlab.com/simonpunk/susfs4ksu.git \
-            -b kernel-5.4 susfs_src
-
           cd kernel_src
-
-          # Copy SUSFS source files
-          cp ../susfs_src/kernel_patches/fs/susfs.c \
-            fs/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs.h \
-            include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/susfs_def.h \
-            include/linux/ 2>/dev/null || true
-          cp ../susfs_src/kernel_patches/include/linux/sus_su.h \
-            include/linux/ 2>/dev/null || true
-
-          # Apply SUSFS patch
-          patch -p1 --fuzz=3 < ../susfs_patch.patch \
-            && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings (normal)"
-
-          # Bersihkan file sisa patch
-          find . -name "*.orig" -delete 2>/dev/null || true
-          find . -name "*.rej" -delete 2>/dev/null || true
+          echo ">>> Cek apakah hook benar-benar tersisip ke source kernel..."
+          HOOK_FOUND=$(grep -rl "ksu_handle_\|ksu_kprobe\|KSU_HOOK" \
+            fs/exec.c fs/open.c fs/read_write.c fs/stat.c \
+            security/security.c drivers/input/input.c \
+            2>/dev/null | wc -l)
+          echo "File dengan hook terdeteksi: $HOOK_FOUND"
+          if [ "$HOOK_FOUND" -eq 0 ]; then
+            echo "::warning::Tidak ada jejak hook KSU di source umum (fs/exec.c dkk)."
+            echo "::warning::Build kemungkinan akan gagal di 'drivers/kernelsu' dengan error 'No hooks were defined'."
+            echo "::warning::Ini tanda susfs-main branch SukiSU TIDAK auto-patch hook untuk kernel custom ini."
+            echo "::warning::Lanjut build untuk lihat error pasti, tapi siapkan rencana B (lihat penjelasan chat)."
+          else
+            echo "OK - hook terdeteksi tersisip di source."
+          fi
 
       - name: Generate defconfig for fogos
         run: |
@@ -114,11 +101,11 @@ jobs:
             fi
           done
 
-          echo ">>> Step 3: Enable KSU + SUSFS + disable LTO"
+          echo ">>> Step 3: Enable KSU/SukiSU + SUSFS + KPM (non-GKI requirements)"
           ./scripts/config --file ../out/.config \
             -e KSU \
-            -d KSU_WITH_KPROBES \
             -e KSU_MANUAL_HOOK \
+            -d KSU_WITH_KPROBES \
             -e KSU_SUSFS \
             -e KSU_SUSFS_SUS_PATH \
             -e KSU_SUSFS_SUS_MOUNT \
@@ -131,18 +118,22 @@ jobs:
             -e KSU_SUSFS_ENABLE_LOG \
             -e KSU_SUSFS_OPEN_REDIRECT \
             -d KSU_SUSFS_SUS_SU \
+            -e KPM \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL
+
+          echo ">>> Step 4: Disable LTO to prevent interactive prompt (terbukti perlu dari log kamu)"
+          ./scripts/config --file ../out/.config \
             -d LTO_CLANG \
             -e LTO_NONE \
-            -d RELR
+            -d RELR 2>/dev/null || true
 
-          echo ">>> Step 4: Finalize dengan olddefconfig"
-          # Pipe yes untuk jawab semua interactive prompt secara otomatis
+          echo ">>> Step 5: olddefconfig (auto-jawab semua prompt)"
           yes "" | make $MAKE_ARGS olddefconfig
 
-          echo "=== Verifikasi KSU + SUSFS ==="
-          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" \
+          echo "=== Verifikasi config ==="
+          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KPM" \
             ../out/.config || echo "WARNING: config tidak ditemukan!"
-          echo "=== Verifikasi LTO ==="
           grep "CONFIG_LTO" ../out/.config || true
 
       - name: Build kernel
@@ -150,8 +141,9 @@ jobs:
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
 
-          echo ">>> Build dengan $(nproc) threads..."
-          # Pipe yes untuk handle semua interactive prompt saat build
+          echo ">>> Building with $(nproc) threads..."
+          # Tidak ada dtbo.img di build system SM6375 ini -- sudah dikonfirmasi
+          # dari log build sebelumnya, jadi hanya build Image.gz
           yes "" | make -j$(nproc) \
             O=../out \
             ARCH=arm64 \
@@ -163,12 +155,11 @@ jobs:
             LLVM_IAS=1 \
             Image.gz 2>&1 | tee ../build.log
 
-          echo ">>> Cek hasil build..."
           if [ -f ../out/arch/arm64/boot/Image.gz ]; then
-            echo "BUILD SUCCESS!"
-            ls -lh ../out/arch/arm64/boot/Image.gz
+            echo "BUILD SUCCESS"
+            ls -lh ../out/arch/arm64/boot/
           else
-            echo "BUILD FAILED - Last 100 lines of log:"
+            echo "BUILD FAILED - Last 100 lines:"
             tail -100 ../build.log
             exit 1
           fi
@@ -181,10 +172,8 @@ jobs:
           cp out/arch/arm64/boot/Image.gz ak3/
 
           cat > ak3/anykernel.sh << 'EOF'
-          # AnyKernel3 for fogos (Moto G34/G45 5G)
-          # KSU-Next (legacy) + SUSFS
           properties() { '
-          kernel.string=KSU-Next + SUSFS | fogos | AyakaUI & others
+          kernel.string=SukiSU Ultra + SUSFS | fogos | AyakaUI & others
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -208,18 +197,17 @@ jobs:
           EOF
 
           DATE=$(date +%Y%m%d-%H%M)
-          ZIP="kernel-fogos-ksunext-susfs-${DATE}.zip"
+          ZIP="kernel-fogos-sukisu-susfs-${DATE}.zip"
           cd ak3
           zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
-          echo "=== ZIP siap ==="
           ls -lh "${ZIP}"
 
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-fogos-ksunext-susfs-${{ github.run_number }}
+          name: kernel-fogos-sukisu-susfs-${{ github.run_number }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
           if-no-files-found: error
@@ -231,14 +219,3 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: build.log
           retention-days: 7
-
-      - name: Summary
-        if: success()
-        run: |
-          echo "================================"
-          echo "BUILD BERHASIL!"
-          echo "KSU: legacy branch (non-GKI 5.4)"
-          echo "SUSFS: JackA1ltman fixed patch"
-          echo "Device: fogos (Moto G34/G45 5G)"
-          echo "ZIP: ${{ env.ZIP_NAME }}"
-          echo "================================"
