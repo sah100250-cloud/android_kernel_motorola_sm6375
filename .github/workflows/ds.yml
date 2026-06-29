@@ -40,51 +40,58 @@ jobs:
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
       # ============================================================
-      # STEP 1: Setup KernelSU Next dengan mode 'legacy' (untuk non-GKI)
-      # Perhatikan: script membuat folder KernelSU-Next, BUKAN KernelSU
-      # Sumber: https://kernelsu-next.github.io/webpage/pages/installation.html
+      # STEP 1: Setup KernelSU Next dengan mode 'legacy'
+      # Sumber: https://kernelsu-next.github.io/webpage/pages/how-to-integrate-for-non-gki.html
       # ============================================================
-      - name: Setup KernelSU Next (non-GKI mode)
+      - name: Setup KernelSU Next (legacy mode)
         run: |
           cd kernel_src
-          # Gunakan parameter 'legacy' untuk mendukung kernel 4.x - 5.4 non-GKI
-          # Script ini akan membuat folder KernelSU-Next dan symlink ke drivers/kernelsu
+          # legacy mode = untuk kernel 4.x - 5.4 non-GKI
           curl -LSs \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
           echo "=== KernelSU Next version ==="
-          # Folder yang benar adalah KernelSU-Next, BUKAN KernelSU
+          # Folder yang benar adalah KernelSU-Next
           cat KernelSU-Next/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3 || echo "OK"
 
       # ============================================================
-      # STEP 2: Fix untuk Non-GKI - Manual hook
-      # Folder yang benar: KernelSU-Next (bukan KernelSU)
+      # STEP 2: Manual Hook (bukan revert! ini yang bikin error)
+      # Sumber: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#manually-modify-the-kernel-source
       # ============================================================
-      - name: Fix KernelSU Next for Non-GKI
+      - name: Add manual VFS hooks for non-GKI
         run: |
-          # PERHATIAN: Folder yang benar adalah KernelSU-Next, BUKAN KernelSU
-          cd kernel_src/KernelSU-Next
+          cd kernel_src
           
-          echo ">>> Non-GKI: Revert commit untuk kompatibilitas"
-          git revert 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 --no-edit || true
+          echo ">>> Manual Hook: Tambahkan hooks ke fs/exec.c"
+          # Cek apakah sudah ada hook KSU
+          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+            sed -i '/#include <linux\/sched.h>/a #ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
+            # Tambahkan pemanggilan hook di do_execveat_common
+            sed -i '/return retval;/i #ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, argv, envp, &flags);\n#endif' fs/exec.c
+            echo "  Added hooks to fs/exec.c"
+          fi
           
-          echo ">>> Non-GKI: Nonaktifkan KPROBES (manual hook)"
-          find . -name "*.c" -o -name "*.h" | xargs sed -i \
-            's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
+          echo ">>> Manual Hook: Tambahkan hooks ke fs/open.c"
+          if ! grep -q "ksu_handle_open" fs/open.c; then
+            sed -i '/#include <linux\/fs.h>/a #ifdef CONFIG_KSU\nextern int ksu_handle_open(struct file **file, int *flags, int *mode);\n#endif' fs/open.c
+            sed -i '/return fd;/i #ifdef CONFIG_KSU\n\tksu_handle_open(&f, &flags, &mode);\n#endif' fs/open.c
+            echo "  Added hooks to fs/open.c"
+          fi
           
-          echo ">>> Non-GKI: Aktifkan KSU_MANUAL_HOOK"
-          sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
-          
-          echo ">>> Non-GKI: Tambahkan SUSFS_MAGIC untuk kompatibilitas"
-          if ! grep -q "SUSFS_MAGIC" include/ksu.h; then
-            echo "#define SUSFS_MAGIC 0x53465346" >> include/ksu.h
+          echo ">>> Manual Hook: Tambahkan hooks ke fs/read_write.c"
+          if ! grep -q "ksu_handle_read_write" fs/read_write.c; then
+            sed -i '/#include <linux\/fs.h>/a #ifdef CONFIG_KSU\nextern int ksu_handle_read_write(struct file *file, int *count, loff_t *pos);\n#endif' fs/read_write.c
+            echo "  Added hooks to fs/read_write.c"
           fi
 
+      # ============================================================
+      # STEP 3: Fix kernel 5.4 compatibility
+      # ============================================================
       - name: Fix kernel 5.4 compatibility issues
         run: |
           cd kernel_src
           
-          echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
+          echo ">>> Fix 1: linux/pgtable.h"
           find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
             xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
               sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
@@ -98,7 +105,7 @@ jobs:
             echo "  Fixed sulog.h"
           fi
           
-          echo ">>> Fix 3: Buat linux/pgtable.h compat wrapper"
+          echo ">>> Fix 3: pgtable.h wrapper"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
             printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
@@ -106,8 +113,7 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 3: Apply SUSFS patch
-      # Gunakan patch gabungan dari hauzer yang sudah terbukti berhasil
+      # STEP 4: SUSFS patch (pakai dari sidex15 yang sudah terbukti)
       # ============================================================
       - name: Apply SUSFS patch
         run: |
@@ -118,7 +124,7 @@ jobs:
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
           
-          echo ">>> Step 1: Copy file SUSFS ke kernel source"
+          echo ">>> Step 1: Copy SUSFS files"
           cp susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
@@ -134,18 +140,18 @@ jobs:
             && echo "SUSFS patch: OK" \
             || echo "SUSFS patch: applied with warnings"
           
-          echo ">>> Step 4: Bersihkan file reject"
+          echo ">>> Step 4: Cleanup"
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
       # ============================================================
-      # STEP 4: Perbaikan manual untuk error compile
+      # STEP 5: Fix SUSFS compilation errors
       # ============================================================
       - name: Fix SUSFS compilation errors
         run: |
           cd kernel_src
           
-          echo ">>> Fix 1: Tambahkan include susfs.h di file yang error"
+          echo ">>> Fix 1: Tambahkan include susfs.h"
           for file in fs/notify/fdinfo.c kernel/kallsyms.c; do
             if [ -f "$file" ] && grep -q "susfs_" "$file"; then
               if ! grep -q "#include <linux/susfs.h>" "$file"; then
@@ -155,7 +161,7 @@ jobs:
             fi
           done
           
-          echo ">>> Fix 2: Tambahkan definisi DEFAULT_KSU_MNT_ID"
+          echo ">>> Fix 2: DEFAULT_KSU_MNT_ID"
           if ! grep -q "DEFAULT_KSU_MNT_ID" include/linux/susfs.h; then
             cat >> include/linux/susfs.h << 'SUSFS_EOF'
           #ifndef DEFAULT_KSU_MNT_ID
@@ -165,7 +171,7 @@ jobs:
             echo "  Added DEFAULT_KSU_MNT_ID"
           fi
           
-          echo ">>> Fix 3: Tambahkan field susfs_task_state ke task_struct"
+          echo ">>> Fix 3: susfs_task_state di task_struct"
           if ! grep -q "susfs_task_state" include/linux/sched.h; then
             sed -i '/struct task_struct {/,/};/ {
               /unsigned int sequential_io;/a\
@@ -174,7 +180,7 @@ jobs:
             echo "  Added susfs_task_state"
           fi
           
-          echo ">>> Fix 4: Tambahkan TASK_STRUCT_NON_ROOT_USER_APP_PROC"
+          echo ">>> Fix 4: TASK_STRUCT_NON_ROOT_USER_APP_PROC"
           if ! grep -q "TASK_STRUCT_NON_ROOT_USER_APP_PROC" include/linux/sched.h; then
             cat >> include/linux/sched.h << 'SCHED_EOF'
           #ifndef TASK_STRUCT_NON_ROOT_USER_APP_PROC
@@ -184,15 +190,11 @@ jobs:
             echo "  Added TASK_STRUCT_NON_ROOT_USER_APP_PROC"
           fi
           
-          echo ">>> Fix 5: Tambahkan INODE_STATE_SUS_PATH"
+          echo ">>> Fix 5: INODE_STATE_SUS_PATH"
           if ! grep -q "INODE_STATE_SUS_PATH" include/linux/fs.h; then
             sed -i '/#define I_FREEING/a #define INODE_STATE_SUS_PATH 0x00000040' include/linux/fs.h
             echo "  Added INODE_STATE_SUS_PATH"
           fi
-          
-          echo ">>> Verifikasi perbaikan"
-          echo "susfs_task_state: $(grep -c susfs_task_state include/linux/sched.h || echo 'NOT FOUND')"
-          echo "DEFAULT_KSU_MNT_ID: $(grep -c DEFAULT_KSU_MNT_ID include/linux/susfs.h || echo 'NOT FOUND')"
 
       - name: Generate defconfig for fogos
         run: |
@@ -219,7 +221,6 @@ jobs:
           ./scripts/config --file ../out/.config \
             -e KSU \
             -d KSU_WITH_KPROBES \
-            -e KSU_MANUAL_HOOK \
             -e KSU_SUSFS \
             -e KSU_SUSFS_HAS_MAGIC_MOUNT \
             -e KSU_SUSFS_SUS_PATH \
