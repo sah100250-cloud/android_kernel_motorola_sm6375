@@ -24,7 +24,7 @@ jobs:
       - name: Clone kernel source
         run: |
           git clone --depth=1 \
-            https://github.comMotorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
+            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
             -b sixteen \
             kernel_src
           echo "=== Kernel version ==="
@@ -60,30 +60,25 @@ jobs:
       - name: Fix kernel 5.4 compatibility issues
         run: |
           cd kernel_src
-          echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
+          echo ">>> Fix 1: linux/pgtable.h"
           find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
             xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
               sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
-              echo "  Fixed pgtable.h: $f"
+              echo "  Fixed: $f"
             done
-          echo ">>> Fix 2: sulog.h missing linux/init.h"
+          echo ">>> Fix 2: sulog.h"
           SULOG="drivers/kernelsu/feature/sulog.h"
-          if [ -f "$SULOG" ]; then
-            if ! grep -q "linux/init.h" "$SULOG"; then
-              sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
-              echo "  Fixed sulog.h: added linux/init.h"
-            else
-              echo "  sulog.h: already has init.h"
-            fi
+          if [ -f "$SULOG" ] && ! grep -q "linux/init.h" "$SULOG"; then
+            sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
+            echo "  Fixed sulog.h"
           fi
-          echo ">>> Fix 3: Create linux/pgtable.h compat wrapper"
+          echo ">>> Fix 3: pgtable.h wrapper"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
-            printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
+            printf '/* Compatibility wrapper */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
               > include/linux/pgtable.h
-            echo "  Created include/linux/pgtable.h compat wrapper"
           fi
-          echo ">>> Verifikasi fixes..."
+          echo ">>> Verifikasi"
           grep -r "linux/pgtable.h" drivers/kernelsu/ 2>/dev/null \
             && echo "WARNING: masih ada pgtable.h" \
             || echo "pgtable.h OK"
@@ -117,39 +112,24 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
-          echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
-          echo ">>> Step 2: Merge fogos ext configs"
-          for cfg in \
-            arch/arm64/configs/vendor/ext_config/moto-holi.config \
-            arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
+          for cfg in arch/arm64/configs/vendor/ext_config/moto-holi.config \
+                     arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
             if [ -f "$cfg" ]; then
               echo "  Merging: $cfg"
-              ./scripts/kconfig/merge_config.sh \
-                -m -O ../out ../out/.config "$cfg"
+              ./scripts/kconfig/merge_config.sh -m -O ../out ../out/.config "$cfg"
             fi
           done
-          echo ">>> Step 3: Set KSU + SUSFS + LTO configs"
           ./scripts/config --file ../out/.config \
-            -e KSU \
-            -d KSU_WITH_KPROBES \
-            -e KSU_MANUAL_HOOK \
-            -e KSU_SUSFS \
-            -e KSU_SUSFS_SUS_PATH \
-            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU -d KSU_WITH_KPROBES -e KSU_MANUAL_HOOK \
+            -e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
             -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
             -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-            -e KSU_SUSFS_SUS_KSTAT \
-            -d KSU_SUSFS_SUS_OVERLAYFS \
-            -e KSU_SUSFS_TRY_UMOUNT \
-            -e KSU_SUSFS_SPOOF_UNAME \
-            -e KSU_SUSFS_ENABLE_LOG \
-            -e KSU_SUSFS_OPEN_REDIRECT \
+            -e KSU_SUSFS_SUS_KSTAT -d KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_OPEN_REDIRECT \
             -d KSU_SUSFS_SUS_SU \
-            -e LTO_NONE \
-            -d LTO_CLANG \
-            -e RELR
-          echo ">>> Step 4: olddefconfig"
+            -e LTO_NONE -d LTO_CLANG -e RELR
           yes "" | make $MAKE_ARGS olddefconfig
           echo "=== Config check ==="
           grep "CONFIG_KSU" ../out/.config | grep -v "^#" || echo "WARNING: KSU missing!"
@@ -170,15 +150,11 @@ jobs:
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
           echo ">>> Building with $(nproc) threads..."
           yes "" | make -j$(nproc) \
-            O=../out \
-            ARCH=arm64 \
-            CC=clang \
+            O=../out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            Image 2>&1 | tee ../build.log
+            LLVM=1 LLVM_IAS=1 Image 2>&1 | tee ../build.log
           if [ -f ../out/arch/arm64/boot/Image ]; then
             echo "=============================="
             echo "BUILD SUCCESS!"
@@ -192,52 +168,38 @@ jobs:
 
       - name: Package AnyKernel3
         run: |
-          git clone --depth=1 \
-            https://github.com/osm0sis/AnyKernel3.git ak3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cp out/arch/arm64/boot/Image ak3/
           cat > ak3/anykernel.sh << 'EOF'
-# AnyKernel3 Ramdisk Mod Script
-# osm0sis @ xda-developers
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
 
-## AnyKernel setup
-# global properties
-properties() { '
-kernel.string=RKSU + SUSFS | fogos | AyakaUI
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=0
-device.name1=fogos
-device.name2=moto_fogos
-device.name3=XT2363-2
-device.name4=XT2363-3
-device.name5=XT2363-5
-device.name6=XT2349-1
-supported.versions=
-supported.patchlevels=
-'; }
+          properties() { '
+          kernel.string=RKSU + SUSFS | fogos | AyakaUI
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=fogos
+          device.name2=moto_fogos
+          device.name3=XT2363-2
+          device.name4=XT2363-3
+          device.name5=XT2363-5
+          device.name6=XT2349-1
+          '; }
 
-## AnyKernel install
-# boot shell variables
-# block=auto: deteksi otomatis partisi boot (direkomendasikan untuk kompatibilitas luas)
-# is_slot_device=1: aktifkan deteksi slot A/B (wajib untuk fogos)
-block=auto
-is_slot_device=1
-ramdisk_compression=auto
-patch_vbmeta_flag=auto
+          block=auto
+          is_slot_device=1
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
 
-# import functions - DO NOT REMOVE
-. tools/ak3-core.sh
-
-## boot install
-dump_boot
-write_boot
-## end boot install
-EOF
-          echo "=== Verifikasi anykernel.sh ==="
+          . tools/ak3-core.sh
+          dump_boot
+          write_boot
+          EOF
+          echo "=== anykernel.sh ==="
           cat ak3/anykernel.sh
-          echo "=== Syntax check ==="
           bash -n ak3/anykernel.sh && echo "SYNTAX OK" || echo "SYNTAX ERROR!"
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
@@ -246,7 +208,6 @@ EOF
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
           ls -lh "${ZIP}"
-          echo "=== Isi ZIP ==="
           unzip -l "${ZIP}" | head -30
 
       - name: Upload kernel zip
