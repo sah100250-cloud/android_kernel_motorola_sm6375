@@ -1,4 +1,4 @@
-name: Kernel fogos | KernelSU Next + SUSFS
+name: Kernel fogos | KernelSU-Next + SUSFS
 
 on:
   workflow_dispatch:
@@ -40,24 +40,23 @@ jobs:
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
       # ============================================================
-      # STEP 1: Setup KernelSU Next (bukan official KernelSU)
-      # Sumber: https://kernelsu-next.github.io/
+      # STEP 1: Setup KernelSU-Next dari branch 'main' (bukan 'next')
       # ============================================================
-      - name: Setup KernelSU Next
+      - name: Setup KernelSU-Next
         run: |
           cd kernel_src
-          # KernelSU Next secara bawaan mendukung non-GKI
-          curl -LSs \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s next
-          echo "=== KernelSU Next version ==="
+          # Clone branch main dari KernelSU-Next (branch 'next' udah gak ada)
+          git clone --depth=1 -b main \
+            https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          # Buat symlink ke drivers/kernelsu
+          ln -sfn KernelSU-Next drivers/kernelsu
+          echo "=== KernelSU-Next version ==="
           cat KernelSU-Next/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3 || echo "OK"
 
       # ============================================================
-      # STEP 2: Non-GKI manual hook (bukan kprobes)
-      # Sumber: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      # STEP 2: Non-GKI manual hook
       # ============================================================
-      - name: Fix KernelSU Next for non-GKI
+      - name: Fix KernelSU-Next for non-GKI
         run: |
           cd kernel_src/KernelSU-Next
           echo ">>> Non-GKI: Nonaktifkan KPROBES"
@@ -65,10 +64,6 @@ jobs:
             's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
           echo ">>> Non-GKI: Aktifkan KSU_MANUAL_HOOK"
           sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
-          echo ">>> Non-GKI: Tambahkan SUSFS_MAGIC"
-          if ! grep -q "SUSFS_MAGIC" include/ksu.h 2>/dev/null; then
-            echo "#define SUSFS_MAGIC 0x53465346" >> include/ksu.h 2>/dev/null || true
-          fi
 
       # ============================================================
       # STEP 3: Fix kernel 5.4 compatibility
@@ -96,34 +91,40 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 4: Apply SUSFS patch (HANYA kernel patch, TIDAK KSU patch)
-      # Sumber: https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd
+      # STEP 4: Apply SUSFS patches
       # ============================================================
-      - name: Apply SUSFS patch for kernel 5.4
+      - name: Apply SUSFS patches
         run: |
           cd kernel_src
-          # Clone SUSFS repo
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
+
           echo ">>> Step 1: Copy SUSFS files"
           cp susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
           cp susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
-          echo ">>> Step 2: Patch kernel 5.4 (HANYA kernel, BUKAN KSU)"
-          # Untuk KernelSU Next, TIDAK perlu patch 10_enable_susfs_for_ksu.patch
-          # Karena KernelSU Next sudah mendukung SUSFS secara bawaan
+
+          echo ">>> Step 2: Patch KernelSU-Next Kconfig"
+          # Patch ini WAJIB untuk menambahkan CONFIG_KSU_SUSFS
+          cp susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU-Next/
+          cd KernelSU-Next
+          patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
+          cd ..
+
+          echo ">>> Step 3: Patch kernel 5.4"
           cp susfs_src/kernel_patches/50_add_susfs_in_kernel-5.4.patch ../
           patch -p1 --fuzz=3 < ../50_add_susfs_in_kernel-5.4.patch \
             && echo "SUSFS patch: OK" \
             || echo "SUSFS patch: applied with warnings"
-          echo ">>> Step 3: Cleanup"
+
+          echo ">>> Step 4: Cleanup"
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
       # ============================================================
-      # STEP 5: Fix struct kstat (tambahkan include)
+      # STEP 5: Fix struct kstat
       # ============================================================
       - name: Fix missing struct kstat declaration
         run: |
@@ -146,9 +147,9 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
-          echo ">>> Step 1: Base holi-qgki defconfig"
+
           make $MAKE_ARGS vendor/holi-qgki_defconfig
-          echo ">>> Step 2: Merge fogos ext configs"
+
           for cfg in arch/arm64/configs/vendor/ext_config/moto-holi.config \
                      arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
             if [ -f "$cfg" ]; then
@@ -156,7 +157,8 @@ jobs:
               ./scripts/kconfig/merge_config.sh -m -O ../out ../out/.config "$cfg"
             fi
           done
-          echo ">>> Step 3: Set KSU + SUSFS configs"
+
+          # Enable KSU_SUSFS dan semua opsi terkait
           ./scripts/config --file ../out/.config \
             -e KSU \
             -d KSU_WITH_KPROBES \
@@ -177,8 +179,23 @@ jobs:
             -e LTO_NONE \
             -d LTO_CLANG \
             -e RELR
-          echo ">>> Step 4: olddefconfig"
+
+          # Fallback: langsung edit .config (untuk berjaga-jaga)
+          sed -i 's/^# CONFIG_KSU_SUSFS is not set/CONFIG_KSU_SUSFS=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT is not set/CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_SUS_PATH is not set/CONFIG_KSU_SUSFS_SUS_PATH=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_SUS_MOUNT is not set/CONFIG_KSU_SUSFS_SUS_MOUNT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT is not set/CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT is not set/CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_SUS_KSTAT is not set/CONFIG_KSU_SUSFS_SUS_KSTAT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_TRY_UMOUNT is not set/CONFIG_KSU_SUSFS_TRY_UMOUNT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_SPOOF_UNAME is not set/CONFIG_KSU_SUSFS_SPOOF_UNAME=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_ENABLE_LOG is not set/CONFIG_KSU_SUSFS_ENABLE_LOG=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^# CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set/CONFIG_KSU_SUSFS_OPEN_REDIRECT=y/' ../out/.config 2>/dev/null || true
+          sed -i 's/^CONFIG_KSU_SUSFS_SUS_SU=y/# CONFIG_KSU_SUSFS_SUS_SU is not set/' ../out/.config 2>/dev/null || true
+
           yes "" | make $MAKE_ARGS olddefconfig
+
           echo "=========================================="
           echo "=== CONFIG CHECK ==="
           echo "=========================================="
@@ -232,7 +249,7 @@ jobs:
           # osm0sis @ xda-developers
 
           properties() { '
-          kernel.string=KernelSU Next + SUSFS | fogos | AyakaUI
+          kernel.string=KernelSU-Next + SUSFS | fogos | AyakaUI
           do.devicecheck=1
           do.modules=0
           do.systemless=1
