@@ -1,4 +1,4 @@
-name: Kernel fogos | KSU Next + SUSFS
+name: Kernel fogos | KernelSU Next + SUSFS
 
 on:
   workflow_dispatch:
@@ -40,93 +40,103 @@ jobs:
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
       # ============================================================
-      # STEP 1: Setup KernelSU Next (bukan official KernelSU)
-      # Menggunakan branch 'next' yang sudah mendukung non-GKI
+      # STEP 1: Setup KernelSU Next dengan branch 'next'
+      # Sumber: https://kernelsu-next.github.io/
+      # KernelSU Next mendukung non-GKI kernel 4.x - 5.4 dengan LTS mode
       # ============================================================
       - name: Setup KernelSU Next
         run: |
           cd kernel_src
-          # KernelSU Next - versi yang paling kompatibel dengan SUSFS 1.5.5
-          # Referensi: https://github.com/hauzer/poco-f3_lineageos_kernelsu-next_susfs
-          KSU_NEXT_VERSION="v1.1.1"
+          # Gunakan branch 'next' yang sudah mature untuk non-GKI
+          # Jangan pakai tag v1.1.1 karena masih ada bug
           curl -LSs \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s ${KSU_NEXT_VERSION}
+            | bash -s next
           echo "=== KernelSU Next version ==="
-          grep "^VERSION\|^PATCHLEVEL" KernelSU/kernel/Makefile | head -3
+          cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL" | head -3 || echo "OK"
 
       # ============================================================
-      # STEP 2: Fix untuk Non-GKI - Manual hook (bukan kprobes)
-      # Referensi: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      # STEP 2: Fix untuk Non-GKI
+      # Sumber: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
       # ============================================================
-      - name: Fix KernelSU Next for Non-GKI (manual hook)
+      - name: Fix KernelSU Next for Non-GKI
         run: |
           cd kernel_src/KernelSU
           
-          echo ">>> Non-GKI: Gunakan manual hook, nonaktifkan kprobes"
-          # Manual hook adalah metode yang direkomendasikan untuk non-GKI
-          # Sumber: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+          echo ">>> Non-GKI: Revert commit untuk kompatibilitas"
+          # Commit ini menghapus dukungan non-GKI, harus di-revert
+          git revert 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 --no-edit || true
+          
+          echo ">>> Non-GKI: Nonaktifkan KPROBES (manual hook)"
+          # Ganti semua #ifdef CONFIG_KPROBES menjadi #if defined(CONFIG_KPROBES) && 0
+          # Ini adalah langkah WAJIB untuk non-GKI
           find . -name "*.c" -o -name "*.h" | xargs sed -i \
             's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
           
-          # Pastikan KSU_MANUAL_HOOK aktif
+          echo ">>> Non-GKI: Aktifkan KSU_MANUAL_HOOK"
           sed -i 's/^#ifndef CONFIG_KSU_MANUAL_HOOK/#if 1/g' kernel/ksu.c || true
           
-          echo ">>> Non-GKI: Tambahkan kompatibilitas untuk SUSFS"
-          # Beberapa versi KSUNext memerlukan patch tambahan untuk SUSFS
-          # Sumber: https://github.com/hauzer/poco-f3_lineageos_kernelsu-next_susfs
+          echo ">>> Non-GKI: Tambahkan dukungan SUSFS_MAGIC"
+          # Untuk kompatibilitas dengan SUSFS
+          if ! grep -q "SUSFS_MAGIC" include/ksu.h; then
+            echo "#define SUSFS_MAGIC 0x53465346" >> include/ksu.h
+          fi
 
       - name: Fix kernel 5.4 compatibility issues
         run: |
           cd kernel_src
-          echo ">>> Fix 1: linux/pgtable.h"
+          
+          echo ">>> Fix 1: linux/pgtable.h tidak ada di kernel 5.4"
           find drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | \
             xargs grep -l "linux/pgtable.h" 2>/dev/null | while read f; do
               sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
               echo "  Fixed: $f"
             done
-          echo ">>> Fix 2: sulog.h"
+          
+          echo ">>> Fix 2: sulog.h missing linux/init.h"
           SULOG="drivers/kernelsu/feature/sulog.h"
           if [ -f "$SULOG" ] && ! grep -q "linux/init.h" "$SULOG"; then
             sed -i '1s/^/#include <linux\/init.h>\n/' "$SULOG"
             echo "  Fixed sulog.h"
           fi
-          echo ">>> Fix 3: pgtable.h wrapper"
+          
+          echo ">>> Fix 3: Buat linux/pgtable.h compat wrapper"
           mkdir -p include/linux
           if [ ! -f "include/linux/pgtable.h" ]; then
-            printf '/* Compatibility wrapper */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
+            printf '/* Compatibility wrapper for kernel < 5.8 */\n#ifndef _LINUX_PGTABLE_COMPAT_H\n#define _LINUX_PGTABLE_COMPAT_H\n#include <asm/pgtable.h>\n#endif\n' \
               > include/linux/pgtable.h
           fi
 
       # ============================================================
-      # STEP 3: Apply SUSFS patch untuk kernel 5.4
-      # Gunakan patch dari susfs4ksu (kernel-5.4 branch)
+      # STEP 3: Apply SUSFS patch dari susfs4ksu official
+      # Sumber: https://gitlab.com/simonpunk/susfs4ksu/-/tree/kernel-5.4
       # ============================================================
       - name: Apply SUSFS patch for kernel 5.4
         run: |
+          # Clone SUSFS dengan tag stabil v1.5.5
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
           
           cd kernel_src
           
-          # Copy file SUSFS
+          echo ">>> Step 1: Copy file SUSFS ke kernel source"
           cp ../susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
           
-          # Patch KernelSU Kconfig agar muncul opsi KSU_SUSFS
+          echo ">>> Step 2: Patch KernelSU Kconfig (10_enable_susfs_for_ksu.patch)"
           cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
           cd KernelSU && patch -p1 --fuzz=3 < 10_enable_susfs_for_ksu.patch || true && cd ..
           
-          # Patch kernel 5.4 - gunakan patch dari susfs4ksu official
+          echo ">>> Step 3: Patch kernel 5.4 (50_add_susfs_in_kernel-5.4.patch)"
           cp ../susfs_src/kernel_patches/50_add_susfs_in_kernel-5.4.patch ../
           patch -p1 --fuzz=3 < ../50_add_susfs_in_kernel-5.4.patch \
             && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings"
+            || echo "SUSFS patch: applied with warnings (some hunks may fail - this is normal)"
           
-          # Bersihkan file reject
+          echo ">>> Step 4: Bersihkan file reject"
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
@@ -140,12 +150,10 @@ jobs:
           
           echo ">>> Fix 1: Tambahkan include susfs.h di file yang error"
           for file in fs/notify/fdinfo.c kernel/kallsyms.c; do
-            if [ -f "$file" ]; then
-              if grep -q "susfs_" "$file"; then
-                if ! grep -q "#include <linux/susfs.h>" "$file"; then
-                  sed -i '1i #include <linux/susfs.h>' "$file"
-                  echo "  Added include to $file"
-                fi
+            if [ -f "$file" ] && grep -q "susfs_" "$file"; then
+              if ! grep -q "#include <linux/susfs.h>" "$file"; then
+                sed -i '1i #include <linux/susfs.h>' "$file"
+                echo "  Added include to $file"
               fi
             fi
           done
@@ -160,17 +168,7 @@ jobs:
             echo "  Added DEFAULT_KSU_MNT_ID"
           fi
           
-          echo ">>> Fix 3: Tambahkan definisi SUSFS_MAGIC (untuk kompatibilitas SukiSU/Next)"
-          if ! grep -q "SUSFS_MAGIC" include/linux/susfs.h; then
-            cat >> include/linux/susfs.h << 'SUSFS_EOF2'
-          #ifndef SUSFS_MAGIC
-          #define SUSFS_MAGIC 0x53465346
-          #endif
-          SUSFS_EOF2
-            echo "  Added SUSFS_MAGIC"
-          fi
-          
-          echo ">>> Fix 4: Tambahkan field susfs_task_state ke task_struct"
+          echo ">>> Fix 3: Tambahkan field susfs_task_state ke task_struct"
           if ! grep -q "susfs_task_state" include/linux/sched.h; then
             sed -i '/struct task_struct {/,/};/ {
               /unsigned int sequential_io;/a\
@@ -179,7 +177,7 @@ jobs:
             echo "  Added susfs_task_state to task_struct"
           fi
           
-          echo ">>> Fix 5: Tambahkan TASK_STRUCT_NON_ROOT_USER_APP_PROC"
+          echo ">>> Fix 4: Tambahkan TASK_STRUCT_NON_ROOT_USER_APP_PROC"
           if ! grep -q "TASK_STRUCT_NON_ROOT_USER_APP_PROC" include/linux/sched.h; then
             cat >> include/linux/sched.h << 'SCHED_EOF'
           #ifndef TASK_STRUCT_NON_ROOT_USER_APP_PROC
@@ -189,7 +187,7 @@ jobs:
             echo "  Added TASK_STRUCT_NON_ROOT_USER_APP_PROC"
           fi
           
-          echo ">>> Fix 6: Tambahkan INODE_STATE_SUS_PATH"
+          echo ">>> Fix 5: Tambahkan INODE_STATE_SUS_PATH"
           if ! grep -q "INODE_STATE_SUS_PATH" include/linux/fs.h; then
             sed -i '/#define I_FREEING/a #define INODE_STATE_SUS_PATH 0x00000040' include/linux/fs.h
             echo "  Added INODE_STATE_SUS_PATH"
@@ -198,7 +196,6 @@ jobs:
           echo ">>> Verifikasi perbaikan"
           echo "susfs_task_state: $(grep -c susfs_task_state include/linux/sched.h || echo 'NOT FOUND')"
           echo "DEFAULT_KSU_MNT_ID: $(grep -c DEFAULT_KSU_MNT_ID include/linux/susfs.h || echo 'NOT FOUND')"
-          echo "SUSFS_MAGIC: $(grep -c SUSFS_MAGIC include/linux/susfs.h || echo 'NOT FOUND')"
 
       - name: Generate defconfig for fogos
         run: |
@@ -208,7 +205,11 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          
+          echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
+          
+          echo ">>> Step 2: Merge fogos ext configs"
           for cfg in arch/arm64/configs/vendor/ext_config/moto-holi.config \
                      arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
             if [ -f "$cfg" ]; then
@@ -216,22 +217,40 @@ jobs:
               ./scripts/kconfig/merge_config.sh -m -O ../out ../out/.config "$cfg"
             fi
           done
+          
+          echo ">>> Step 3: Set KSU + SUSFS configs"
           ./scripts/config --file ../out/.config \
-            -e KSU -d KSU_WITH_KPROBES -e KSU_MANUAL_HOOK \
-            -e KSU_SUSFS -e KSU_SUSFS_HAS_MAGIC_MOUNT \
-            -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU \
+            -d KSU_WITH_KPROBES \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_HAS_MAGIC_MOUNT \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
             -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
             -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-            -e KSU_SUSFS_SUS_KSTAT -d KSU_SUSFS_SUS_OVERLAYFS \
-            -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_SPOOF_UNAME \
-            -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_OPEN_REDIRECT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -d KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_OPEN_REDIRECT \
             -d KSU_SUSFS_SUS_SU \
-            -e LTO_NONE -d LTO_CLANG -e RELR
+            -e LTO_NONE \
+            -d LTO_CLANG \
+            -e RELR
+          
+          echo ">>> Step 4: olddefconfig"
           yes "" | make $MAKE_ARGS olddefconfig
-          echo "=== Config check ==="
+          
+          echo "=========================================="
+          echo "=== CONFIG CHECK ==="
+          echo "=========================================="
           grep "CONFIG_KSU" ../out/.config | grep -v "^#" || echo "WARNING: KSU missing!"
           grep "CONFIG_KSU_SUSFS" ../out/.config | grep -v "^#" || echo "WARNING: SUSFS missing!"
           grep "CONFIG_LTO" ../out/.config | grep -v "^#" || echo "WARNING: LTO missing!"
+          echo "=========================================="
+          
           cp ../out/.config ../kernel.config
 
       - name: Upload kernel config (for debugging)
@@ -245,6 +264,7 @@ jobs:
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
+          
           echo ">>> Building with $(nproc) threads..."
           yes "" | make -j$(nproc) \
             O=../out ARCH=arm64 CC=clang \
@@ -252,6 +272,7 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             LLVM=1 LLVM_IAS=1 Image 2>&1 | tee ../build.log
+          
           if [ -f ../out/arch/arm64/boot/Image ]; then
             echo "=============================="
             echo "BUILD SUCCESS!"
@@ -267,12 +288,13 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cp out/arch/arm64/boot/Image ak3/
+          
           cat > ak3/anykernel.sh << 'EOF'
           # AnyKernel3 Ramdisk Mod Script
           # osm0sis @ xda-developers
 
           properties() { '
-          kernel.string=KSU Next + SUSFS | fogos | AyakaUI
+          kernel.string=KernelSU Next + SUSFS | fogos | AyakaUI
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -295,9 +317,11 @@ jobs:
           dump_boot
           write_boot
           EOF
+          
           echo "=== anykernel.sh ==="
           cat ak3/anykernel.sh
           bash -n ak3/anykernel.sh && echo "SYNTAX OK" || echo "SYNTAX ERROR!"
+          
           DATE=$(date +%Y%m%d-%H%M)
           ZIP="kernel-fogos-ksunext-susfs-${DATE}.zip"
           cd ak3
