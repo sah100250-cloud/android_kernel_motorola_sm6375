@@ -1,10 +1,10 @@
-name: Build Kernel — Moto G45 5G (final single-file)
+name: Build Kernel — Moto G45 5G (final fixed)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: 'Kernel repository (owner/repo) to build (public preferred).'
+        description: 'Kernel repository (owner/repo).'
         required: false
         default: 'sah100250-cloud/android_kernel_motorola_sm6375'
         type: string
@@ -127,7 +127,7 @@ jobs:
               echo "git clone succeeded"
               success=1
             else
-              echo "git clone failed (see snippet):"
+              echo "git clone failed (snippet):"
               sed -n '1,200p' /tmp/clone.err || true
             fi
           fi
@@ -135,8 +135,13 @@ jobs:
           if [ $success -eq 0 ]; then
             echo "All attempts to fetch ${REPO}@${BRANCH} failed; falling back to workflow repo contents"
             mkdir -p kernel_source
-            # copy workflow repo contents (best-effort)
-            cp -r "${GITHUB_WORKSPACE}/." kernel_source || true
+            # avoid copying into itself (when workflow repo == kernel target)
+            if [ "${GITHUB_WORKSPACE}/" != "${WORKDIR}/kernel_source/" ]; then
+              cp -r "${GITHUB_WORKSPACE}/." kernel_source || true
+            else
+              echo "Workflow repo equals kernel target; kernel_source will be current workspace"
+              # already in workspace; leave as-is
+            fi
             success=1
           fi
 
@@ -201,34 +206,28 @@ jobs:
           fi
           if [ -d "$TMPSUS/kernel" ]; then
             cp -rv "$TMPSUS/kernel/"* . 2>/dev/null || true
-            echo "SUSFS kernel patches copied"
           fi
           if [ -d "$TMPSUS/susfs" ]; then
             cp -rv "$TMPSUS/susfs" ./susfs 2>/dev/null || true
-            echo "SUSFS module copied"
           fi
           rm -rf "$TMPSUS" || true
 
-      - name: Patch defconfig (safe for 5.4)
+      - name: Patch defconfig (exclude backups)
         run: |
           set -euo pipefail
           cd "${WORKDIR}/kernel_source" || exit 1
           if [ -d "kernel_src" ]; then KR="kernel_src"; else KR="."; fi
           cd "$KR" || exit 1
           DEVICE="${DEVICE:-fogos}"
-          DEF=""
-          for c in \
-            "arch/arm64/configs/vendor/${DEVICE}_defconfig" \
-            "arch/arm64/configs/vendor/${DEVICE}" \
-            "arch/arm64/configs/vendor/sm6375_${DEVICE}_defconfig" \
-            "arch/arm64/configs/${DEVICE}_defconfig"; do
-            if [ -f "$c" ]; then DEF="$c"; break; fi
-          done
-          if [ -z "$DEF" ]; then
-            DEF=$(find arch/arm64/configs -type f -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" 2>/dev/null | head -n1 || true)
-          fi
-          if [ -n "$DEF" ]; then
-            cp "$DEF" "${DEF}.bak" || true
+          # find defconfig but exclude .bak/.orig files
+          DEF_FILE=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) ! -iname "*.bak" ! -iname "*~" ! -iname "*.orig" 2>/dev/null | head -n1 || true)
+          if [ -n "$DEF_FILE" ]; then
+            # strip common backup suffixes if accidentally matched
+            CLEAN_DEF="$(basename "$DEF_FILE")"
+            CLEAN_DEF="${CLEAN_DEF%%.bak}"
+            CLEAN_DEF="${CLEAN_DEF%%.orig}"
+            echo "Using defconfig: $DEF_FILE (basename: $CLEAN_DEF)"
+            cp "$DEF_FILE" "${DEF_FILE}.ci.bak" || true
             printf '\n%s\n' "# Injected: KSU/SUSFS (CI)" \
               "CONFIG_KSU=y" \
               "CONFIG_KPROBES=y" \
@@ -239,21 +238,20 @@ jobs:
               "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
               "CONFIG_MODULES=y" \
               "CONFIG_EXT4_FS=y" \
-              >> "$DEF"
-            awk '!seen[$0]++ || /^#/' "$DEF" > /tmp/def.dedup || true
-            mv /tmp/def.dedup "$DEF" || true
-            echo "Patched defconfig: $DEF"
+              >> "$DEF_FILE"
+            awk '!seen[$0]++ || /^#/' "$DEF_FILE" > /tmp/def.dedup || true
+            mv /tmp/def.dedup "$DEF_FILE" || true
+            echo "Patched defconfig: $DEF_FILE (backup: ${DEF_FILE}.ci.bak)"
           else
             echo "::warning::No defconfig found; build may fail"
           fi
 
-      - name: Build kernel (robust detection & defconfig)
+      - name: Build kernel (fix CROSS_COMPILE + robust defconfig)
         run: |
           set -euo pipefail
           cd "${WORKDIR}/kernel_source" || exit 1
 
-          # --- locate kernel Makefile (with VERSION) ---
-          KROOT=""
+          # detect kernel root reliably
           if [ -f Makefile ] && grep -m1 -E '^VERSION' Makefile >/dev/null 2>&1; then
             KROOT="."
           elif [ -f kernel_src/Makefile ] && grep -m1 -E '^VERSION' kernel_src/Makefile >/dev/null 2>&1; then
@@ -262,62 +260,73 @@ jobs:
             candidate=$(find . -maxdepth 3 -type f -name Makefile -exec grep -l -m1 -E '^VERSION' {} \; 2>/dev/null | head -n1 || true)
             if [ -n "$candidate" ]; then
               KROOT=$(dirname "$candidate")
+            else
+              echo "::error::Kernel Makefile with VERSION not found; listing top-level:"
+              ls -la || true
+              exit 1
             fi
-          fi
-
-          if [ -z "$KROOT" ]; then
-            echo "::error::Could not find kernel Makefile with VERSION; listing tree for debug:"
-            ls -la || true
-            exit 1
           fi
 
           echo "Kernel root: $KROOT"
           cd "$KROOT" || exit 1
-          echo "PWD: $(pwd)"
-          ls -la | sed -n '1,200p'
+          echo "PWD: $(pwd)"; ls -la | sed -n '1,200p'
 
           export ARCH=arm64
           export SUBARCH=arm64
 
+          # ensure CROSS_COMPILE is set to aarch64 cross prefix if available
+          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            echo "Set CROSS_COMPILE=aarch64-linux-gnu- (using cross gcc/binutils)"
+          else
+            echo "aarch64 cross compiler not found in PATH"
+          fi
+
+          # prefer clang if available, but keep CROSS_COMPILE for binutils to avoid host-gcc miscompile
           if command -v clang >/dev/null 2>&1; then
             export CC=clang
-            echo "Using clang"
+            echo "Using clang as CC (CROSS_COMPILE may still be used for binutils)"
           elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            export CROSS_COMPILE=aarch64-linux-gnu-
-            echo "Using aarch64-linux-gnu- cross compiler"
+            # use cross gcc; CROSS_COMPILE set above
+            echo "Using aarch64-linux-gnu-gcc cross compiler"
           else
-            echo "::error::No suitable compiler (clang or aarch64-linux-gnu-gcc)"
+            echo "::error::No suitable compiler (clang or aarch64-linux-gnu-gcc) found"
             exit 1
           fi
 
-          # find defconfig (if any)
-          DEF_FILE=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) 2>/dev/null | head -n1 || true)
+          # find a real defconfig (exclude backups)
+          DEF_FILE=$(find arch/arm64/configs -type f \( -iname "*${DEVICE}*" -o -iname "*sm6375*" -o -iname "*defconfig*" \) ! -iname "*.bak" ! -iname "*~" 2>/dev/null | head -n1 || true)
 
           if [ -n "$DEF_FILE" ]; then
             DEFBASE=$(basename "$DEF_FILE")
-            echo "Found defconfig: $DEF_FILE (target: $DEFBASE)"
-            # try make <defconfig> target (some trees expect exact name)
-            if make ARCH=arm64 "$DEFBASE"; then
-              echo "make $DEFBASE: OK"
+            # strip suffixes if any
+            DEFBASE="${DEFBASE%%.bak}"
+            echo "Found defconfig: $DEF_FILE -> target $DEFBASE"
+            # try to run make <defbase>, but many kernels expect e.g. defconfig names without '_defconfig' suffix
+            if make ARCH=arm64 "$DEFBASE" 2>/dev/null; then
+              echo "make $DEFBASE succeeded"
             else
-              echo "make $DEFBASE failed or target not present; falling back to 'make defconfig'"
+              echo "make $DEFBASE not recognized by this tree; trying 'make ${DEFBASE%_defconfig}_defconfig' then fallback to defconfig"
+              # sometimes config file is named 'gki_defconfig' but target might be 'gki_defconfig' - we already tried; still fallback:
               make ARCH=arm64 defconfig || true
             fi
           else
-            echo "::warning::No defconfig found; attempting make defconfig"
+            echo "::warning::No defconfig detected; running make defconfig"
             make ARCH=arm64 defconfig || true
           fi
 
+          # verify .config exists
           if [ ! -f .config ]; then
-            echo "::error::.config missing after defconfig step; aborting (listing configs)"
+            echo "::error::.config missing after defconfig step; aborting"
             ls -la arch/arm64/configs | sed -n '1,200p' || true
             exit 1
           fi
 
+          # build (log to build.log)
           make ARCH=arm64 -j"$(nproc)" 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
-            echo "::error::Kernel build failed (exit $rc)"
+            echo "::error::Kernel build failed (exit $rc). build.log uploaded by artifact step."
             exit $rc
           fi
           echo "Kernel build succeeded."
@@ -331,7 +340,7 @@ jobs:
             ${WORKDIR}/kernel_source/**/build.log
             ${WORKDIR}/build/logs/*.log
 
-      - name: Package and upload kernel zip (if built)
+      - name: Package & upload kernel zip (if built)
         if: success()
         run: |
           set -euo pipefail
