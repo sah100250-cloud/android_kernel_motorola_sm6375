@@ -29,9 +29,9 @@ jobs:
             kernel_src
           echo "=== Kernel version ==="
           head -5 kernel_src/Makefile
-          echo "=== Available vendor configs ==="
+          echo "=== Available configs ==="
           ls kernel_src/arch/arm64/configs/vendor/
-          echo "=== Available ext_configs ==="
+          echo "=== Ext configs ==="
           ls kernel_src/arch/arm64/configs/vendor/ext_config/ \
             2>/dev/null || echo "no ext_config dir"
 
@@ -44,28 +44,32 @@ jobs:
           tar -xf clang.tar.gz -C clang
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
-      - name: Setup KernelSU-Next
+      - name: Setup KernelSU-Next (legacy branch for non-GKI 5.4)
         run: |
           cd kernel_src
-          echo ">>> Integrating KernelSU-Next..."
+          # Pakai legacy branch - ini yang support non-GKI kernel 5.4
+          # Branch 'next' punya bug sulog.h untuk non-GKI
           curl -LSs \
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
-            | bash -s next
-          echo "KSU-Next version:"
-          cat KernelSU/kernel/Makefile | grep "^VERSION" | head -3
+            | bash -s legacy
+          echo "=== KSU-Next version ==="
+          cat KernelSU/kernel/Makefile | grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" | head -3
 
       - name: Apply SUSFS patch for kernel 5.4
         run: |
+          # Download fixed SUSFS patch untuk kernel 5.4 non-GKI
           wget -q \
             https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
             -O susfs_patch.patch
 
+          # Clone SUSFS source files
           git clone --depth=1 \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             -b kernel-5.4 susfs_src
 
           cd kernel_src
 
+          # Copy SUSFS source files
           cp ../susfs_src/kernel_patches/fs/susfs.c \
             fs/ 2>/dev/null || true
           cp ../susfs_src/kernel_patches/include/linux/susfs.h \
@@ -75,10 +79,12 @@ jobs:
           cp ../susfs_src/kernel_patches/include/linux/sus_su.h \
             include/linux/ 2>/dev/null || true
 
+          # Apply SUSFS patch
           patch -p1 --fuzz=3 < ../susfs_patch.patch \
             && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings"
+            || echo "SUSFS patch: applied with warnings (normal)"
 
+          # Bersihkan file sisa patch
           find . -name "*.orig" -delete 2>/dev/null || true
           find . -name "*.rej" -delete 2>/dev/null || true
 
@@ -92,7 +98,7 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
 
-          echo ">>> Step 1: Apply base holi-qgki defconfig"
+          echo ">>> Step 1: Base holi-qgki defconfig"
           make $MAKE_ARGS vendor/holi-qgki_defconfig
 
           echo ">>> Step 2: Merge fogos ext configs"
@@ -100,15 +106,15 @@ jobs:
             arch/arm64/configs/vendor/ext_config/moto-holi.config \
             arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
             if [ -f "$cfg" ]; then
-              echo "Merging: $cfg"
+              echo "  Merging: $cfg"
               ./scripts/kconfig/merge_config.sh \
                 -m -O ../out ../out/.config "$cfg"
             else
-              echo "Warning: $cfg not found"
+              echo "  Warning: $cfg not found, skipping"
             fi
           done
 
-          echo ">>> Step 3: Enable KSU + SUSFS"
+          echo ">>> Step 3: Enable KSU + SUSFS + disable LTO"
           ./scripts/config --file ../out/.config \
             -e KSU \
             -d KSU_WITH_KPROBES \
@@ -124,21 +130,19 @@ jobs:
             -e KSU_SUSFS_SPOOF_UNAME \
             -e KSU_SUSFS_ENABLE_LOG \
             -e KSU_SUSFS_OPEN_REDIRECT \
-            -d KSU_SUSFS_SUS_SU
-
-          echo ">>> Step 4: Disable LTO to prevent interactive prompt"
-          ./scripts/config --file ../out/.config \
+            -d KSU_SUSFS_SUS_SU \
             -d LTO_CLANG \
-            -e LTO_NONE
+            -e LTO_NONE \
+            -d RELR
 
-          echo ">>> Step 5: olddefconfig"
-          make $MAKE_ARGS olddefconfig
+          echo ">>> Step 4: Finalize dengan olddefconfig"
+          # Pipe yes untuk jawab semua interactive prompt secara otomatis
+          yes "" | make $MAKE_ARGS olddefconfig
 
-          echo "=== KSU + SUSFS config check ==="
+          echo "=== Verifikasi KSU + SUSFS ==="
           grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" \
-            ../out/.config || echo "ERROR: config missing!"
-
-          echo "=== LTO config check ==="
+            ../out/.config || echo "WARNING: config tidak ditemukan!"
+          echo "=== Verifikasi LTO ==="
           grep "CONFIG_LTO" ../out/.config || true
 
       - name: Build kernel
@@ -146,8 +150,9 @@ jobs:
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
 
-          echo ">>> Building with $(nproc) threads..."
-          make -j$(nproc) \
+          echo ">>> Build dengan $(nproc) threads..."
+          # Pipe yes untuk handle semua interactive prompt saat build
+          yes "" | make -j$(nproc) \
             O=../out \
             ARCH=arm64 \
             CC=clang \
@@ -158,12 +163,13 @@ jobs:
             LLVM_IAS=1 \
             Image.gz 2>&1 | tee ../build.log
 
+          echo ">>> Cek hasil build..."
           if [ -f ../out/arch/arm64/boot/Image.gz ]; then
-            echo "BUILD SUCCESS"
-            ls -lh ../out/arch/arm64/boot/
+            echo "BUILD SUCCESS!"
+            ls -lh ../out/arch/arm64/boot/Image.gz
           else
-            echo "BUILD FAILED - Last 80 lines:"
-            tail -80 ../build.log
+            echo "BUILD FAILED - Last 100 lines of log:"
+            tail -100 ../build.log
             exit 1
           fi
 
@@ -175,8 +181,10 @@ jobs:
           cp out/arch/arm64/boot/Image.gz ak3/
 
           cat > ak3/anykernel.sh << 'EOF'
+          # AnyKernel3 for fogos (Moto G34/G45 5G)
+          # KSU-Next (legacy) + SUSFS
           properties() { '
-          kernel.string=KSU-Next + SUSFS | fogos AyakaUI
+          kernel.string=KSU-Next + SUSFS | fogos | AyakaUI & others
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -205,12 +213,13 @@ jobs:
           zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
+          echo "=== ZIP siap ==="
           ls -lh "${ZIP}"
 
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-fogos-${{ github.run_number }}
+          name: kernel-fogos-ksunext-susfs-${{ github.run_number }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
           if-no-files-found: error
@@ -222,3 +231,14 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: build.log
           retention-days: 7
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "================================"
+          echo "BUILD BERHASIL!"
+          echo "KSU: legacy branch (non-GKI 5.4)"
+          echo "SUSFS: JackA1ltman fixed patch"
+          echo "Device: fogos (Moto G34/G45 5G)"
+          echo "ZIP: ${{ env.ZIP_NAME }}"
+          echo "================================"
